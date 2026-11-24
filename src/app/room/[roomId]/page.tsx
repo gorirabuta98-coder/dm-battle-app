@@ -4,7 +4,7 @@ import { Suspense, useEffect, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { ref, onValue, update, get } from 'firebase/database';
 import { db } from '@/lib/firebase';
-import { CardData, CardInstance, GameRoom, PlayerState } from '@/types/game';
+import { CardData, CardInstance, GameRoom, KindanType, PlayerState } from '@/types/game';
 import { DeckPreset } from '@/data/decks';
 import CutInOverlay, { CutInEvent } from '@/components/CutInOverlay';
 
@@ -31,6 +31,44 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
   return instances;
 }
 
+function createKindanCard(kindanType: KindanType | undefined, seals: CardInstance[]): CardInstance | null {
+  if (kindanType === 'dokindam') {
+    return {
+      instanceId: `kindan-dokindam-${Math.random().toString(36).substring(2, 7)}`,
+      id: 'kindan-dokindam-x',
+      name: '禁断 ～封印されしX～ / 伝説の禁断 ドキンダムX',
+      cost: 99,
+      civilization: ['fire'],
+      type: 'creature',
+      power: 99999,
+      text: '【禁断の鼓動】ゲーム開始時、封印を6つ付けてバトルゾーンに置く。コマンドを出した時、封印を1つ墓地に置く。封印がすべてなくなった時、裏返して「伝説の禁断 ドキンダムX」に禁断解放する。',
+      tapped: false,
+      faceUp: true,
+      underCards: seals,
+      kindanRole: 'dokindam',
+      kindanAwakened: false,
+    };
+  }
+  if (kindanType === 'dormageddon') {
+    return {
+      instanceId: `kindan-dormageddon-${Math.random().toString(36).substring(2, 7)}`,
+      id: 'kindan-dormageddon-x',
+      name: 'FORBIDDEN STAR ～世界最後の日～ / 終焉の禁断 ドルマゲドンX',
+      cost: 99,
+      civilization: ['fire', 'darkness'],
+      type: 'creature',
+      power: 99999,
+      text: '【禁断爆発】ゲーム開始時、封印を4つ付けてバトルゾーンに置く。封印がすべてなくなった時、裏返して「終焉の禁断 ドルマゲドンX」に禁断爆発する。',
+      tapped: false,
+      faceUp: true,
+      underCards: seals,
+      kindanRole: 'dormageddon',
+      kindanAwakened: false,
+    };
+  }
+  return null;
+}
+
 function BattleRoomContent() {
   const params = useParams();
   const router = useRouter();
@@ -40,40 +78,29 @@ function BattleRoomContent() {
   const [room, setRoom] = useState<GameRoom | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
 
-  // 自分のカード選択（操作＆超拡大表示）
   const [selectedCard, setSelectedCard] = useState<{
     card: CardInstance;
     zone: ZoneType;
   } | null>(null);
 
-  // 相手（または観戦中）の表向きカード拡大プレビュー専用モーダル
   const [inspectCard, setInspectCard] = useState<{
     card: CardInstance;
     ownerName: string;
+    sourceZone?: ZoneType;
+    isOpponentCard?: boolean;
   } | null>(null);
 
-  // シールドブレイク直後の秘匿確認モーダル
   const [brokenShieldCard, setBrokenShieldCard] = useState<CardInstance | null>(null);
-
-  // 1つ戻る（Undo）用の操作履歴スタック
   const [undoStack, setUndoStack] = useState<string[]>([]);
-
-  // 山札全確認モーダル
   const [deckSearchOpen, setDeckSearchOpen] = useState(false);
-
-  // 墓地全確認モーダル
   const [graveSearchOpen, setGraveSearchOpen] = useState(false);
-
-  // 山札の上から見る枚数（1〜10枚）
   const [peekCount, setPeekCount] = useState<number>(4);
 
-  // 山札の上からN枚めくって見るモーダル（自分だけ or 相手にも公開）
   const [peekState, setPeekState] = useState<{
     cards: CardInstance[];
     isPublic: boolean;
   } | null>(null);
 
-  // 自由進化ビルダー（場・マナ・墓地・手札・山札から複数枚選んで進化元にする）
   const [evolutionBuilder, setEvolutionBuilder] = useState<{
     evolvingCard: CardInstance;
     fromZone: 'hand' | 'mana' | 'graveyard';
@@ -81,7 +108,6 @@ function BattleRoomContent() {
     selectedMaterials: SelectedEvolutionMaterial[];
   } | null>(null);
 
-  // 革命チェンジの対象選択モーダル
   const [revolutionChangePending, setRevolutionChangePending] = useState<{
     card: CardInstance;
     fromZone: 'hand' | 'mana' | 'graveyard';
@@ -89,7 +115,6 @@ function BattleRoomContent() {
 
   const [resetting, setResetting] = useState(false);
 
-  // 相手に見せる「今何をしているか」の通知
   const setInspectingStatus = async (text: string | null) => {
     if (!roomId) return;
     await update(ref(db, `rooms/${roomId}`), {
@@ -97,7 +122,6 @@ function BattleRoomContent() {
     });
   };
 
-  // 両者＆観戦者の画面中央にカードをデカデカとスッと提示する
   const triggerCutIn = async (
     type: CutInEvent['type'],
     playerName: string,
@@ -179,7 +203,158 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), newState);
   };
 
-  // 【1つ戻る（Undo）】
+  // 【禁断専用】封印を1枚外す（墓地へ送る）／山札から封印を1枚乗せる／禁断解放（裏返す）
+  const handleRemoveOneSeal = async (kindanCard: CardInstance) => {
+    if (!me || isSpectator) return;
+    const seals = kindanCard.underCards || [];
+    if (seals.length === 0) return alert('外せる封印がもうありません');
+
+    const removedSeal: CardInstance = {
+      ...seals[seals.length - 1],
+      faceUp: true,
+      tapped: false,
+      underCards: [],
+    };
+    const remainingSeals = seals.slice(0, -1);
+
+    const updatedKindan: CardInstance = {
+      ...kindanCard,
+      underCards: remainingSeals,
+    };
+
+    const nextBZ = (me.battleZone || []).map((c) =>
+      c.instanceId === kindanCard.instanceId ? updatedKindan : c
+    );
+    const nextGrave = [...(me.graveyard || []), removedSeal];
+
+    await updateMyState({
+      battleZone: nextBZ,
+      graveyard: nextGrave,
+    });
+
+    setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
+  };
+
+  const handleAddOneSealFromDeck = async (kindanCard: CardInstance) => {
+    if (!me || isSpectator) return;
+    if ((me.deck || []).length === 0) return alert('山札がありません');
+
+    const nextDeck = [...(me.deck || [])];
+    const newSeal: CardInstance = {
+      ...nextDeck.shift()!,
+      faceUp: false,
+      tapped: false,
+      underCards: [],
+    };
+
+    const updatedKindan: CardInstance = {
+      ...kindanCard,
+      underCards: [...(kindanCard.underCards || []), newSeal],
+    };
+
+    const nextBZ = (me.battleZone || []).map((c) =>
+      c.instanceId === kindanCard.instanceId ? updatedKindan : c
+    );
+
+    await updateMyState({
+      deck: nextDeck,
+      battleZone: nextBZ,
+    });
+
+    setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
+  };
+
+  const handleToggleKindanAwaken = async (kindanCard: CardInstance) => {
+    if (!me || isSpectator) return;
+    const nextAwakened = !kindanCard.kindanAwakened;
+    const awakenedName =
+      kindanCard.kindanRole === 'dokindam'
+        ? nextAwakened
+          ? '伝説の禁断 ドキンダムX（禁断解放！）'
+          : '禁断 ～封印されしX～'
+        : nextAwakened
+        ? '終焉の禁断 ドルマゲドンX（禁断爆発！）'
+        : 'FORBIDDEN STAR ～世界最後の日～';
+
+    const updatedKindan: CardInstance = {
+      ...kindanCard,
+      name: awakenedName,
+      kindanAwakened: nextAwakened,
+    };
+
+    const nextBZ = (me.battleZone || []).map((c) =>
+      c.instanceId === kindanCard.instanceId ? updatedKindan : c
+    );
+
+    await updateMyState({ battleZone: nextBZ });
+    setSelectedCard(null);
+
+    if (nextAwakened) {
+      await triggerCutIn(
+        'evolution',
+        me.name,
+        updatedKindan,
+        kindanCard.kindanRole === 'dokindam'
+          ? '🔥 封印解除！禁断解放！！'
+          : '💀 終焉の禁断爆発！！'
+      );
+    }
+  };
+
+  // 相手のクリーチャーを新しい表向きシールドとして相手シールドゾーンに追加
+  const handleSendOpponentCardToFaceUpShield = async (
+    targetCard: CardInstance,
+    sourceZone: ZoneType
+  ) => {
+    if (!opponent || !topPlayerId || isSpectator) return;
+
+    const removeFrom = (list: CardInstance[]) =>
+      list.filter((c) => c.instanceId !== targetCard.instanceId);
+
+    let nextOppBZ = [...(opponent.battleZone || [])];
+    let nextOppMana = [...(opponent.mana || [])];
+    let nextOppGrave = [...(opponent.graveyard || [])];
+    let nextOppShields = [...(opponent.shields || [])];
+
+    if (sourceZone === 'battleZone') nextOppBZ = removeFrom(nextOppBZ);
+    if (sourceZone === 'mana') nextOppMana = removeFrom(nextOppMana);
+    if (sourceZone === 'graveyard') nextOppGrave = removeFrom(nextOppGrave);
+    if (sourceZone === 'shields') nextOppShields = removeFrom(nextOppShields);
+
+    if (targetCard.underCards && targetCard.underCards.length > 0) {
+      const freedUnder = targetCard.underCards.map((u) => ({
+        ...u,
+        tapped: false,
+        faceUp: true,
+        underCards: [],
+      }));
+      nextOppGrave.push(...freedUnder);
+    }
+
+    const faceUpShieldCard: CardInstance = {
+      ...targetCard,
+      tapped: false,
+      faceUp: true,
+      underCards: [],
+    };
+    nextOppShields.push(faceUpShieldCard);
+
+    await update(ref(db, `rooms/${roomId}/players/${topPlayerId}`), {
+      battleZone: nextOppBZ,
+      mana: nextOppMana,
+      graveyard: nextOppGrave,
+      shields: nextOppShields,
+    });
+
+    setInspectCard(null);
+    await triggerCutIn(
+      'ability',
+      me?.name || 'プレイヤー',
+      faceUpShieldCard,
+      `${opponent.name} の新しいシールドとして表向きで追加！`
+    );
+  };
+
   const handleUndo = async () => {
     if (isSpectator || undoStack.length === 0 || !me) return;
     const lastSnapshotStr = undoStack[undoStack.length - 1];
@@ -196,12 +371,12 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), restored);
   };
 
-  // 【試合リセット】
+  // 【試合リセット】ドキンダムX / ドルマゲドンXの初期封印も含めて完全に最初からやり直す
   const handleResetMatch = async () => {
     if (isSpectator) return;
     if (
       !confirm(
-        '現在の試合を強制終了し、両プレイヤーの山札をシャッフルして最初から（シールド5枚・手札5枚）やり直しますか？'
+        '現在の試合を強制終了し、両プレイヤーの山札をシャッフルして最初から（シールド5枚・手札5枚・禁断封印）やり直しますか？'
       )
     ) {
       return;
@@ -232,7 +407,9 @@ function BattleRoomContent() {
             ...(p.graveyard || []),
           ];
           (p.battleZone || []).forEach((bz) => {
-            collected.push(bz);
+            if (!bz.kindanRole) {
+              collected.push(bz);
+            }
             if (bz.underCards) collected.push(...bz.underCards);
           });
           baseCards = collected;
@@ -241,7 +418,19 @@ function BattleRoomContent() {
         const shuffled = createDeckInstances(baseCards);
         const shields = shuffled.slice(0, 5).map((c) => ({ ...c, faceUp: false }));
         const hand = shuffled.slice(5, 10).map((c) => ({ ...c, faceUp: true }));
-        const deck = shuffled.slice(10);
+
+        const kType: KindanType = p.kindanType || 'none';
+        const sealCount = kType === 'dokindam' ? 6 : kType === 'dormageddon' ? 4 : 0;
+        const seals = shuffled
+          .slice(10, 10 + sealCount)
+          .map((c) => ({ ...c, faceUp: false, tapped: false }));
+        const deck = shuffled.slice(10 + sealCount);
+
+        const initialBZ: CardInstance[] = [];
+        const kindanCard = createKindanCard(kType, seals);
+        if (kindanCard) {
+          initialBZ.push(kindanCard);
+        }
 
         updatedPlayers[pid] = {
           ...p,
@@ -249,7 +438,7 @@ function BattleRoomContent() {
           hand,
           mana: [],
           shields,
-          battleZone: [],
+          battleZone: initialBZ,
           graveyard: [],
         };
       }
@@ -351,7 +540,6 @@ function BattleRoomContent() {
     });
   };
 
-  // 【新機能】山札の上から1〜10枚めくる（「自分だけ見る」or「相手にも見せてめくる」）
   const handlePeekTopDeck = async (count: number, isPublic: boolean) => {
     if (!me || isSpectator || deck.length === 0) return alert('山札がありません');
     const actualCount = Math.min(count, deck.length);
@@ -435,7 +623,7 @@ function BattleRoomContent() {
   const moveCard = async (
     card: CardInstance,
     fromZone: ZoneType,
-    toZone: ZoneType | 'deckTop' | 'deckBottom'
+    toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom'
   ) => {
     if (!me || isSpectator) return;
 
@@ -455,17 +643,20 @@ function BattleRoomContent() {
     if (fromZone === 'shields') nextShields = removeFrom(nextShields);
     if (fromZone === 'graveyard') nextGrave = removeFrom(nextGrave);
 
+    const isFaceUpDest =
+      toZone !== 'shields' && toZone !== 'deckTop' && toZone !== 'deckBottom';
+
     const cleanCard: CardInstance = {
       ...card,
       tapped: false,
-      faceUp: toZone !== 'shields' && toZone !== 'deckTop' && toZone !== 'deckBottom',
+      faceUp: isFaceUpDest,
       underCards: toZone === 'battleZone' ? card.underCards || [] : [],
     };
 
     if (toZone === 'hand') nextHand.push(cleanCard);
     if (toZone === 'mana') nextMana.push(cleanCard);
     if (toZone === 'battleZone') nextBZ.push(cleanCard);
-    if (toZone === 'shields') nextShields.push(cleanCard);
+    if (toZone === 'shields' || toZone === 'shieldsFaceUp') nextShields.push(cleanCard);
     if (toZone === 'graveyard') nextGrave.push(cleanCard);
     if (toZone === 'deckTop') nextDeck.unshift(cleanCard);
     if (toZone === 'deckBottom') nextDeck.push(cleanCard);
@@ -488,6 +679,13 @@ function BattleRoomContent() {
           ? '墓地から登場！'
           : 'バトルゾーンに登場！';
       await triggerCutIn('summon', me.name, cleanCard, originLabel);
+    } else if (toZone === 'shieldsFaceUp') {
+      await triggerCutIn(
+        'ability',
+        me.name,
+        cleanCard,
+        '新しいシールドとして表向きで配置！'
+      );
     }
   };
 
@@ -512,7 +710,6 @@ function BattleRoomContent() {
     await triggerCutIn('attack', me.name, attacker, 'クリーチャーで攻撃宣言！');
   };
 
-  // シールドブレイク処理（相手に見せず直接手札へ＋自分だけ確認モーダル）
   const handleBreakShield = async (card: CardInstance) => {
     if (!me || isSpectator) return;
     const nextShields = shields.filter((c) => c.instanceId !== card.instanceId);
@@ -532,7 +729,6 @@ function BattleRoomContent() {
     setBrokenShieldCard(addedToHand);
   };
 
-  // 【新機能】自由進化の選択トグル（場・マナ・墓地・手札・山札から複数枚チェック）
   const toggleEvolutionMaterial = (card: CardInstance, sourceZone: EvolutionSourceZone) => {
     if (!evolutionBuilder) return;
     const exists = evolutionBuilder.selectedMaterials.some(
@@ -548,7 +744,6 @@ function BattleRoomContent() {
     });
   };
 
-  // 【新機能】自由進化の確定実行（選ばれた複数枚をすべて下に重ねて場に出す）
   const handleConfirmFreeEvolution = async () => {
     if (!me || isSpectator || !evolutionBuilder) return;
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
@@ -563,7 +758,6 @@ function BattleRoomContent() {
     let nextGrave = [...graveyard];
     let nextBZ = [...battleZone];
 
-    // 1. 進化クリーチャー本体を元ゾーンから取り除く
     if (fromZone === 'hand') {
       nextHand = nextHand.filter((c) => c.instanceId !== evolvingCard.instanceId);
     } else if (fromZone === 'mana') {
@@ -572,7 +766,6 @@ function BattleRoomContent() {
       nextGrave = nextGrave.filter((c) => c.instanceId !== evolvingCard.instanceId);
     }
 
-    // 2. 選択されたすべての進化元カードを取り出し、重ねるリストを構築
     const collectedUnderCards: CardInstance[] = [];
     let inheritedTapState = false;
     let firstBZAnchorId: string | null = null;
@@ -588,7 +781,6 @@ function BattleRoomContent() {
           } else {
             bzIdsToRemove.add(found.instanceId);
           }
-          // 既に進化元を持っていた場合はそれも引き継ぐ
           if (found.underCards && found.underCards.length > 0) {
             collectedUnderCards.push(
               ...found.underCards.map((u) => ({ ...u, tapped: false, faceUp: true, underCards: [] }))
@@ -619,16 +811,13 @@ function BattleRoomContent() {
     };
 
     if (firstBZAnchorId) {
-      // バトルゾーンにいた進化元が選ばれている場合：2体目以降のBZ素材を消し、1体目の位置に置き換える
       nextBZ = nextBZ
         .filter((c) => !bzIdsToRemove.has(c.instanceId))
         .map((c) => (c.instanceId === firstBZAnchorId ? evolvedCard : c));
     } else {
-      // マナ進化・墓地進化・デッキ進化など：新しくバトルゾーンに出現
       nextBZ.push(evolvedCard);
     }
 
-    // 山札から進化元を選んでいた場合は自動で山札シャッフル
     const usedDeck = selectedMaterials.some((m) => m.sourceZone === 'deck');
     if (usedDeck && nextDeck.length > 1) {
       for (let i = nextDeck.length - 1; i > 0; i--) {
@@ -657,7 +846,6 @@ function BattleRoomContent() {
     );
   };
 
-  // 革命チェンジ実行
   const handleExecuteRevolutionChange = async (targetCard: CardInstance) => {
     if (!me || isSpectator || !revolutionChangePending) return;
     const { card: incomingCard, fromZone } = revolutionChangePending;
@@ -765,7 +953,7 @@ function BattleRoomContent() {
     }
   };
 
-  // カード表示コンポーネント
+  // カード表示コンポーネント（ドキンダムX / ドルマゲドンX専用グラフィック＆封印枚数表示付き）
   const renderCard = (
     card: CardInstance,
     zone: ZoneType,
@@ -776,6 +964,7 @@ function BattleRoomContent() {
     const showFace = card.faceUp || (isControllable && zone === 'hand');
     const underCount = card.underCards?.length || 0;
     const canClick = isControllable || showFace;
+    const isKindan = !!card.kindanRole;
 
     return (
       <div
@@ -783,13 +972,22 @@ function BattleRoomContent() {
         onClick={() => {
           if (!isControllable) {
             if (showFace) {
-              setInspectCard({ card, ownerName });
+              setInspectCard({
+                card,
+                ownerName,
+                sourceZone: zone,
+                isOpponentCard: !isSpectator,
+              });
             }
             return;
           }
 
           if (zone === 'shields' && !card.faceUp) {
             handleBreakShield(card);
+            return;
+          }
+          if (zone === 'shields' && card.faceUp) {
+            setSelectedCard({ card, zone: 'shields' });
             return;
           }
           if (zone === 'mana') {
@@ -801,12 +999,19 @@ function BattleRoomContent() {
         onContextMenu={(e) => {
           e.preventDefault();
           if (!isControllable) {
-            if (showFace) setInspectCard({ card, ownerName });
+            if (showFace) {
+              setInspectCard({
+                card,
+                ownerName,
+                sourceZone: zone,
+                isOpponentCard: !isSpectator,
+              });
+            }
             return;
           }
           setSelectedCard({ card, zone });
         }}
-        title={showFace ? `${card.name}（タップで拡大表示）` : '裏向きカード'}
+        title={showFace ? `${card.name}（タップで操作・拡大）` : '裏向きカード'}
         className={`relative select-none transition-transform ${
           canClick ? 'cursor-pointer active:scale-95' : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
@@ -814,17 +1019,51 @@ function BattleRoomContent() {
         }`}
       >
         {underCount > 0 && (
-          <div className="absolute -top-2 -left-1.5 w-full h-full rounded-md bg-purple-900 border border-purple-400 shadow-sm pointer-events-none" />
+          <div
+            className={`absolute -top-2 -left-1.5 w-full h-full rounded-md border shadow-sm pointer-events-none ${
+              isKindan
+                ? 'bg-rose-950 border-amber-400'
+                : 'bg-purple-900 border-purple-400'
+            }`}
+          />
         )}
 
         <div
           className={`relative rounded-md shadow-md overflow-hidden flex flex-col justify-between ${
-            showFace
-              ? 'w-14 h-20 sm:w-16 sm:h-24 bg-slate-800 border border-slate-400 text-white'
+            isKindan
+              ? `w-16 h-22 sm:w-20 sm:h-26 border-2 ${
+                  card.kindanAwakened
+                    ? 'bg-gradient-to-br from-rose-700 via-amber-600 to-rose-900 border-yellow-300 ring-2 ring-amber-400'
+                    : 'bg-gradient-to-br from-slate-900 via-rose-950 to-purple-950 border-rose-500'
+                } text-white`
+              : showFace
+              ? `w-14 h-20 sm:w-16 sm:h-24 bg-slate-800 ${
+                  zone === 'shields'
+                    ? 'border-2 border-amber-400 ring-2 ring-amber-400/50'
+                    : 'border border-slate-400'
+                } text-white`
               : 'w-12 h-16 sm:w-14 sm:h-20 bg-indigo-950 border-2 border-amber-500/70 text-amber-300 items-center justify-center'
           }`}
         >
-          {showFace ? (
+          {isKindan ? (
+            <div className="p-1 flex flex-col justify-between items-center h-full text-center">
+              <span
+                className={`w-full text-[8px] font-extrabold px-1 rounded ${
+                  card.kindanAwakened
+                    ? 'bg-yellow-300 text-slate-950'
+                    : 'bg-rose-600 text-white'
+                }`}
+              >
+                {card.kindanAwakened ? '🔥 禁断解放！' : '🔒 鼓動 / 封印中'}
+              </span>
+              <div className="text-[9px] sm:text-[10px] font-extrabold leading-tight line-clamp-2 text-amber-200">
+                {card.kindanRole === 'dokindam' ? 'ドキンダムX' : 'ドルマゲドンX'}
+              </div>
+              <span className="w-full bg-black/80 border border-amber-400/70 text-amber-300 text-[9px] font-extrabold py-0.5 rounded">
+                封印 {underCount}枚
+              </span>
+            </div>
+          ) : showFace ? (
             card.imageUrl ? (
               <>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -833,6 +1072,11 @@ function BattleRoomContent() {
                   alt={card.name}
                   className="w-full h-full object-cover"
                 />
+                {zone === 'shields' && (
+                  <span className="absolute top-0.5 left-0.5 bg-amber-400 text-slate-950 text-[8px] font-extrabold px-1 rounded shadow">
+                    🛡️表盾
+                  </span>
+                )}
                 {card.isShieldTrigger && (
                   <span className="absolute top-0.5 right-0.5 bg-yellow-400 text-slate-950 text-[8px] font-extrabold px-1 rounded shadow">
                     ⚡ST
@@ -863,11 +1107,9 @@ function BattleRoomContent() {
   const untappedManaCount = mana.length - tappedManaCount;
   const turnOwnerName = playersObj[room.turnPlayerId]?.name || 'プレイヤー';
 
-  // 相手が公開めくりを実行している時の表示データ
   const activePublicReveal =
     room.publicReveal && room.publicReveal.playerName !== me?.name ? room.publicReveal : null;
 
-  // 自由進化ビルダーで現在選択中のタブに並べる候補カード一覧
   const getEvolutionCandidates = (): CardInstance[] => {
     if (!evolutionBuilder) return [];
     const excludeId = evolutionBuilder.evolvingCard.instanceId;
@@ -888,7 +1130,6 @@ function BattleRoomContent() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-2 sm:p-4 max-w-6xl mx-auto">
-      {/* 中央デカデカカード提示オーバーレイ */}
       <CutInOverlay event={room.cutIn} />
 
       {/* 上部バー */}
@@ -954,14 +1195,12 @@ function BattleRoomContent() {
         </div>
       </header>
 
-      {/* 山札確認中などのリアルタイムテロップ */}
       {room.inspectingText && (
         <div className="my-1.5 py-1.5 px-4 bg-sky-900/90 border border-sky-400 rounded-lg text-center text-xs sm:text-sm font-bold text-sky-200 animate-pulse">
           🔍 {room.inspectingText}
         </div>
       )}
 
-      {/* 相手（またはプレイヤー）が「相手に見せてめくる」を実行中のリアルタイム公開パネル */}
       {activePublicReveal && activePublicReveal.cards && activePublicReveal.cards.length > 0 && (
         <div className="my-1.5 p-3 bg-amber-950/90 border-2 border-amber-400 rounded-xl space-y-2 shadow-xl">
           <div className="flex items-center justify-between text-xs font-bold text-amber-300">
@@ -1014,24 +1253,23 @@ function BattleRoomContent() {
           </div>
         </div>
 
-        {/* 上側マナ */}
         <div className="flex flex-wrap gap-1 min-h-[32px] bg-slate-950/50 p-1.5 rounded">
           <span className="text-[10px] text-slate-500 mr-1">マナ:</span>
           {oppMana.map((c) => renderCard(c, 'mana', false, opponent?.name || '相手'))}
         </div>
 
-        {/* 上側シールド */}
         <div className="flex flex-wrap gap-1.5 min-h-[40px] bg-slate-950/50 p-1.5 rounded items-center">
-          <span className="text-[10px] text-slate-500 mr-1">シールド:</span>
+          <span className="text-[10px] text-slate-500 mr-1">
+            シールド ({oppShields.length}枚):
+          </span>
           {oppShields.map((c, idx) =>
             renderCard(c, 'shields', false, opponent?.name || '相手', idx)
           )}
         </div>
 
-        {/* 上側バトルゾーン */}
         <div className="flex flex-wrap gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded items-center">
           <span className="text-[10px] text-slate-400 mr-1">
-            バトルゾーン (カードタップで能力拡大):
+            バトルゾーン (タップで能力拡大＆シールド送り):
           </span>
           {oppBattleZone.map((c) =>
             renderCard(c, 'battleZone', false, opponent?.name || '相手')
@@ -1055,17 +1293,15 @@ function BattleRoomContent() {
           </div>
         )}
 
-        {/* 下側バトルゾーン */}
         <div className="flex flex-wrap gap-2 min-h-[85px] bg-slate-800/60 p-2 rounded items-center">
           <span className="text-[10px] text-emerald-400 font-bold mr-1">バトルゾーン:</span>
           {battleZone.map((c) => renderCard(c, 'battleZone', !isSpectator, me?.name || '自分'))}
         </div>
 
-        {/* 下側シールド & 山札・墓地操作ボタン群 */}
         <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950/60 p-2 rounded">
           <div className="flex flex-wrap gap-1.5 items-center">
             <span className="text-[10px] text-amber-400 font-bold mr-1">
-              シールド{!isSpectator && '(タップでブレイク→自分だけ確認して手札へ)'}:
+              シールド ({shields.length}枚){!isSpectator && '(裏タップでブレイク／表タップで拡大)'}:
             </span>
             {shields.map((c, idx) =>
               renderCard(c, 'shields', !isSpectator, me?.name || '自分', idx)
@@ -1099,7 +1335,6 @@ function BattleRoomContent() {
                 山札→シールド
               </button>
 
-              {/* 山札の上から1〜10枚めくる（「自分だけ見る」＆「相手に見せてめくる」） */}
               <div className="flex items-center bg-indigo-950 border border-indigo-500 rounded overflow-hidden">
                 <select
                   value={peekCount}
@@ -1150,7 +1385,6 @@ function BattleRoomContent() {
           )}
         </div>
 
-        {/* 下側マナ */}
         <div className="flex flex-wrap gap-1.5 min-h-[45px] bg-slate-950/60 p-2 rounded items-center justify-between">
           <div className="flex flex-wrap gap-1.5 items-center">
             <span className="text-[10px] text-lime-400 font-bold mr-1">
@@ -1169,7 +1403,6 @@ function BattleRoomContent() {
           )}
         </div>
 
-        {/* 下側手札 */}
         <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
           <div className="text-[10px] text-slate-400 mb-1.5">
             {isSpectator
@@ -1182,7 +1415,7 @@ function BattleRoomContent() {
         </div>
       </section>
 
-      {/* ================= シールドブレイク後の秘匿確認モーダル（自分だけ見られる） ================= */}
+      {/* ================= シールドブレイク後の秘匿確認モーダル ================= */}
       {!isSpectator && brokenShieldCard && (
         <div
           onClick={() => setBrokenShieldCard(null)}
@@ -1260,7 +1493,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー ================= */}
+      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー＆シールド貼り付け ================= */}
       {inspectCard && (
         <div
           onClick={() => setInspectCard(null)}
@@ -1269,9 +1502,8 @@ function BattleRoomContent() {
           <div
             onClick={(e) => {
               e.stopPropagation();
-              setInspectCard(null);
             }}
-            className="bg-slate-900 border-2 border-slate-500 rounded-2xl p-3 sm:p-4 max-w-md w-full max-h-[95vh] flex flex-col items-center justify-between space-y-2.5 shadow-2xl"
+            className="bg-slate-900 border-2 border-slate-500 rounded-2xl p-3 sm:p-4 max-w-md w-full max-h-[95vh] overflow-y-auto flex flex-col items-center justify-between space-y-2.5 shadow-2xl cursor-default"
           >
             <div className="w-full flex items-center justify-between text-xs text-slate-300 font-bold">
               <span>{inspectCard.ownerName} のカード確認</span>
@@ -1283,41 +1515,69 @@ function BattleRoomContent() {
               <img
                 src={inspectCard.card.imageUrl}
                 alt={inspectCard.card.name}
-                className="w-[82vw] max-w-[380px] h-[64vh] max-h-[550px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl"
+                onClick={() => setInspectCard(null)}
+                className="w-[80vw] max-w-[360px] h-[56vh] max-h-[500px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl cursor-pointer"
               />
             ) : (
-              <div className="w-64 h-80 bg-slate-800 rounded-xl flex items-center justify-center font-bold text-lg p-4 text-center">
-                {inspectCard.card.name}
+              <div className="w-full p-4 bg-slate-800 rounded-xl space-y-2 text-center">
+                <div className="font-extrabold text-base text-amber-300">
+                  {inspectCard.card.name}
+                </div>
+                {inspectCard.card.text && (
+                  <p className="text-xs text-slate-200 leading-relaxed text-left">
+                    {inspectCard.card.text}
+                  </p>
+                )}
               </div>
             )}
 
             {(inspectCard.card.underCards?.length || 0) > 0 && (
               <div className="w-full bg-slate-800/80 p-2 rounded-lg text-xs">
                 <div className="text-purple-300 font-bold mb-1">
-                  進化元 ({inspectCard.card.underCards?.length}枚)：
+                  {inspectCard.card.kindanRole
+                    ? `封印枚数：残り ${inspectCard.card.underCards?.length} 枚（裏向き）`
+                    : `進化元 (${inspectCard.card.underCards?.length}枚)：`}
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {inspectCard.card.underCards?.map((u) => (
-                    <button
-                      key={u.instanceId}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setInspectCard({ card: u, ownerName: inspectCard.ownerName });
-                      }}
-                      className="px-2 py-0.5 bg-purple-900 border border-purple-400 rounded text-[11px]"
-                    >
-                      {u.name}
-                    </button>
-                  ))}
-                </div>
+                {!inspectCard.card.kindanRole && (
+                  <div className="flex flex-wrap gap-1">
+                    {inspectCard.card.underCards?.map((u) => (
+                      <button
+                        key={u.instanceId}
+                        onClick={() =>
+                          setInspectCard({ card: u, ownerName: inspectCard.ownerName })
+                        }
+                        className="px-2 py-0.5 bg-purple-900 border border-purple-400 rounded text-[11px]"
+                      >
+                        {u.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
+
+            {!isSpectator &&
+              inspectCard.isOpponentCard &&
+              !inspectCard.card.kindanRole &&
+              (inspectCard.sourceZone === 'battleZone' || inspectCard.sourceZone === 'mana') && (
+                <button
+                  onClick={() =>
+                    handleSendOpponentCardToFaceUpShield(
+                      inspectCard.card,
+                      inspectCard.sourceZone!
+                    )
+                  }
+                  className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition"
+                >
+                  🛡️ 表向きにして相手のシールドに追加（新シールド）
+                </button>
+              )}
 
             <button
               onClick={() => setInspectCard(null)}
               className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 text-white font-bold rounded-xl text-xs sm:text-sm"
             >
-              閉じる（タップでも閉じます）
+              閉じる
             </button>
           </div>
         </div>
@@ -1346,7 +1606,6 @@ function BattleRoomContent() {
                   手札に加える・場に出す・マナや墓地に置くカードを選び、残りを山札の下（または上）に戻してください
                 </p>
               </div>
-              {/* 途中から公開に切り替えることも可能 */}
               {!peekState.isPublic && me && (
                 <button
                   onClick={async () => {
@@ -1441,7 +1700,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル ================= */}
+      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル（ドキンダムX / ドルマゲドンX専用操作付き） ================= */}
       {!isSpectator && selectedCard && (
         <div
           onClick={() => setSelectedCard(null)}
@@ -1462,8 +1721,13 @@ function BattleRoomContent() {
               </div>
             )}
 
-            <div className="text-center">
+            <div className="text-center space-y-1">
               <h3 className="font-bold text-base text-amber-400">{selectedCard.card.name}</h3>
+              {selectedCard.card.kindanRole && (
+                <div className="inline-block px-3 py-1 rounded-full bg-rose-950 border border-rose-500 text-xs font-extrabold text-amber-300">
+                  現在の封印：{selectedCard.card.underCards?.length || 0} 枚
+                </div>
+              )}
               {selectedCard.zone === 'mana' && mana.length > 1 && (
                 <div className="flex flex-wrap justify-center gap-1 mt-1.5 py-1">
                   {mana.map((m) => (
@@ -1483,7 +1747,59 @@ function BattleRoomContent() {
               )}
             </div>
 
+            {/* ドキンダムX / ドルマゲドンX 専用の封印取り外し＆禁断解放パネル */}
+            {selectedCard.card.kindanRole && (
+              <div className="bg-rose-950/70 border border-rose-500/60 rounded-xl p-2.5 space-y-2">
+                <div className="text-[11px] font-bold text-rose-200 text-center">
+                  🔥 禁断・封印コントロール（コマンド召喚時などに1枚ずつ外します）
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs font-extrabold">
+                  <button
+                    onClick={() => handleRemoveOneSeal(selectedCard.card)}
+                    disabled={(selectedCard.card.underCards?.length || 0) === 0}
+                    className="py-2.5 bg-amber-500 hover:bg-amber-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 rounded-lg"
+                  >
+                    🔓 封印を1枚外す（墓地へ）
+                  </button>
+                  <button
+                    onClick={() => handleAddOneSealFromDeck(selectedCard.card)}
+                    disabled={deck.length === 0}
+                    className="py-2.5 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-lg"
+                  >
+                    🔒 山札から封印を1枚乗せる
+                  </button>
+                </div>
+                <button
+                  onClick={() => handleToggleKindanAwaken(selectedCard.card)}
+                  className={`w-full py-2.5 rounded-lg text-xs sm:text-sm font-extrabold transition ${
+                    selectedCard.card.kindanAwakened
+                      ? 'bg-slate-700 hover:bg-slate-600 text-slate-200'
+                      : 'bg-gradient-to-r from-rose-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white shadow-lg'
+                  }`}
+                >
+                  {selectedCard.card.kindanAwakened
+                    ? '↩️ 鼓動状態（封印面）に戻す'
+                    : selectedCard.card.kindanRole === 'dokindam'
+                    ? '🔥 禁断解放！（伝説の禁断 ドキンダムXに裏返す）'
+                    : '💀 禁断爆発！（終焉の禁断 ドルマゲドンXに裏返す）'}
+                </button>
+              </div>
+            )}
+
             <div className="grid grid-cols-2 gap-2 text-xs font-bold">
+              {selectedCard.zone === 'shields' && (
+                <button
+                  onClick={() => {
+                    const c = selectedCard.card;
+                    setSelectedCard(null);
+                    handleBreakShield(c);
+                  }}
+                  className="py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded col-span-2 text-sm font-extrabold"
+                >
+                  💥 このシールドをブレイク（手札に加える）
+                </button>
+              )}
+
               {selectedCard.zone === 'hand' && (
                 <>
                   <button
@@ -1613,6 +1929,7 @@ function BattleRoomContent() {
             </div>
 
             {selectedCard.zone === 'battleZone' &&
+              !selectedCard.card.kindanRole &&
               (selectedCard.card.underCards?.length || 0) > 0 && (
                 <div className="pt-2 border-t border-purple-500/40 space-y-1.5">
                   <div className="text-[11px] font-bold text-purple-300">
@@ -1656,65 +1973,77 @@ function BattleRoomContent() {
                 </div>
               )}
 
-            <div className="pt-2 border-t border-slate-700 space-y-1.5">
-              <div className="text-[10px] text-slate-400 text-center">
-                このカードを別の場所へ送る
+            {!selectedCard.card.kindanRole && (
+              <div className="pt-2 border-t border-slate-700 space-y-1.5">
+                <div className="text-[10px] text-slate-400 text-center">
+                  このカードを別の場所へ送る
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 text-[11px] font-bold">
+                  {selectedCard.zone !== 'hand' && (
+                    <button
+                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'hand')}
+                      className="py-2 bg-slate-700 hover:bg-slate-600 rounded"
+                    >
+                      手札へ
+                    </button>
+                  )}
+                  {selectedCard.zone !== 'battleZone' && selectedCard.zone !== 'hand' && selectedCard.zone !== 'mana' && (
+                    <button
+                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'battleZone')}
+                      className="py-2 bg-amber-600 hover:bg-amber-500 rounded"
+                    >
+                      場へ出す
+                    </button>
+                  )}
+                  {selectedCard.zone !== 'mana' && selectedCard.zone !== 'hand' && (
+                    <button
+                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'mana')}
+                      className="py-2 bg-lime-700 hover:bg-lime-600 rounded"
+                    >
+                      マナへ
+                    </button>
+                  )}
+                  {selectedCard.zone !== 'graveyard' && (
+                    <button
+                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'graveyard')}
+                      className="py-2 bg-rose-800 hover:bg-rose-700 rounded"
+                    >
+                      墓地へ
+                    </button>
+                  )}
+                  {selectedCard.zone !== 'shields' && (
+                    <>
+                      <button
+                        onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'shields')}
+                        className="py-2 bg-amber-800 hover:bg-amber-700 rounded"
+                      >
+                        シールドへ(裏)
+                      </button>
+                      <button
+                        onClick={() =>
+                          moveCard(selectedCard.card, selectedCard.zone, 'shieldsFaceUp')
+                        }
+                        className="py-2 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded"
+                      >
+                        🛡️ 表向きシールドへ
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'deckTop')}
+                    className="py-2 bg-indigo-800 hover:bg-indigo-700 rounded"
+                  >
+                    山札の上へ
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'deckBottom')}
+                    className="py-2 bg-indigo-900 hover:bg-indigo-800 rounded"
+                  >
+                    山札の下へ
+                  </button>
+                </div>
               </div>
-              <div className="grid grid-cols-3 gap-1.5 text-[11px] font-bold">
-                {selectedCard.zone !== 'hand' && (
-                  <button
-                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'hand')}
-                    className="py-2 bg-slate-700 hover:bg-slate-600 rounded"
-                  >
-                    手札へ
-                  </button>
-                )}
-                {selectedCard.zone !== 'battleZone' && selectedCard.zone !== 'hand' && selectedCard.zone !== 'mana' && (
-                  <button
-                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'battleZone')}
-                    className="py-2 bg-amber-600 hover:bg-amber-500 rounded"
-                  >
-                    場へ出す
-                  </button>
-                )}
-                {selectedCard.zone !== 'mana' && selectedCard.zone !== 'hand' && (
-                  <button
-                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'mana')}
-                    className="py-2 bg-lime-700 hover:bg-lime-600 rounded"
-                  >
-                    マナへ
-                  </button>
-                )}
-                {selectedCard.zone !== 'graveyard' && (
-                  <button
-                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'graveyard')}
-                    className="py-2 bg-rose-800 hover:bg-rose-700 rounded"
-                  >
-                    墓地へ
-                  </button>
-                )}
-                {selectedCard.zone !== 'shields' && (
-                  <button
-                    onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'shields')}
-                    className="py-2 bg-amber-800 hover:bg-amber-700 rounded"
-                  >
-                    シールドへ
-                  </button>
-                )}
-                <button
-                  onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'deckTop')}
-                  className="py-2 bg-indigo-800 hover:bg-indigo-700 rounded"
-                >
-                  山札の上へ
-                </button>
-                <button
-                  onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'deckBottom')}
-                  className="py-2 bg-indigo-900 hover:bg-indigo-800 rounded"
-                >
-                  山札の下へ
-                </button>
-              </div>
-            </div>
+            )}
 
             <button
               onClick={() => setSelectedCard(null)}
@@ -1726,7 +2055,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 【新機能】自由進化ビルダー（場・マナ・墓地・手札・山札から複数枚選択可） ================= */}
+      {/* ================= 自由進化ビルダー ================= */}
       {!isSpectator && evolutionBuilder && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-3 sm:p-4 z-50">
           <div className="bg-slate-900 border-2 border-purple-500 rounded-2xl p-4 max-w-3xl w-full max-h-[92vh] flex flex-col space-y-3 shadow-2xl">
@@ -1744,11 +2073,10 @@ function BattleRoomContent() {
               </span>
             </div>
 
-            {/* ゾーン切り替えタブ */}
             <div className="flex flex-wrap gap-1.5 border-b border-slate-700 pb-2 text-xs font-bold">
               {(
                 [
-                  { id: 'battleZone', label: `バトルゾーン (${battleZone.length})` },
+                  { id: 'battleZone', label: `バトルゾーン (${battleZone.filter((c) => !c.kindanRole).length})` },
                   { id: 'mana', label: `マナ (${mana.length})` },
                   { id: 'graveyard', label: `墓地 (${graveyard.length})` },
                   { id: 'hand', label: `手札 (${hand.length})` },
@@ -1771,7 +2099,6 @@ function BattleRoomContent() {
               ))}
             </div>
 
-            {/* 現在選択されている下敷きカード一覧バッジ */}
             {evolutionBuilder.selectedMaterials.length > 0 && (
               <div className="bg-purple-950/60 border border-purple-500/40 rounded-lg p-2 flex flex-wrap gap-1.5 items-center">
                 <span className="text-[10px] font-bold text-purple-300">下に重ねる順：</span>
@@ -1790,46 +2117,47 @@ function BattleRoomContent() {
               </div>
             )}
 
-            {/* 候補カード一覧（タップで複数選択トグル） */}
             <div className="overflow-y-auto grid grid-cols-2 sm:grid-cols-4 md:grid-cols-5 gap-2.5 py-1 flex-1">
-              {getEvolutionCandidates().map((c) => {
-                const isSelected = evolutionBuilder.selectedMaterials.some(
-                  (m) => m.card.instanceId === c.instanceId
-                );
-                return (
-                  <div
-                    key={c.instanceId}
-                    onClick={() => toggleEvolutionMaterial(c, evolutionBuilder.activeTab)}
-                    className={`cursor-pointer rounded-xl p-2 border-2 flex flex-col items-center space-y-1 transition ${
-                      isSelected
-                        ? 'bg-purple-900/70 border-purple-400 scale-[1.02]'
-                        : 'bg-slate-800 border-slate-700 hover:border-slate-500'
-                    }`}
-                  >
-                    {c.imageUrl ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={c.imageUrl}
-                        alt={c.name}
-                        className="w-20 h-28 object-cover rounded border border-slate-600"
-                      />
-                    ) : (
-                      <div className="w-20 h-28 bg-slate-700 rounded flex items-center justify-center text-xs text-center p-1">
-                        {c.name}
-                      </div>
-                    )}
-                    <div className="text-[11px] font-bold text-center truncate w-full">{c.name}</div>
-                    <span
-                      className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
-                        isSelected ? 'bg-purple-500 text-white' : 'bg-slate-700 text-slate-300'
+              {getEvolutionCandidates()
+                .filter((c) => !c.kindanRole)
+                .map((c) => {
+                  const isSelected = evolutionBuilder.selectedMaterials.some(
+                    (m) => m.card.instanceId === c.instanceId
+                  );
+                  return (
+                    <div
+                      key={c.instanceId}
+                      onClick={() => toggleEvolutionMaterial(c, evolutionBuilder.activeTab)}
+                      className={`cursor-pointer rounded-xl p-2 border-2 flex flex-col items-center space-y-1 transition ${
+                        isSelected
+                          ? 'bg-purple-900/70 border-purple-400 scale-[1.02]'
+                          : 'bg-slate-800 border-slate-700 hover:border-slate-500'
                       }`}
                     >
-                      {isSelected ? '✓ 選択中' : '選択する'}
-                    </span>
-                  </div>
-                );
-              })}
-              {getEvolutionCandidates().length === 0 && (
+                      {c.imageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={c.imageUrl}
+                          alt={c.name}
+                          className="w-20 h-28 object-cover rounded border border-slate-600"
+                        />
+                      ) : (
+                        <div className="w-20 h-28 bg-slate-700 rounded flex items-center justify-center text-xs text-center p-1">
+                          {c.name}
+                        </div>
+                      )}
+                      <div className="text-[11px] font-bold text-center truncate w-full">{c.name}</div>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
+                          isSelected ? 'bg-purple-500 text-white' : 'bg-slate-700 text-slate-300'
+                        }`}
+                      >
+                        {isSelected ? '✓ 選択中' : '選択する'}
+                      </span>
+                    </div>
+                  );
+                })}
+              {getEvolutionCandidates().filter((c) => !c.kindanRole).length === 0 && (
                 <p className="col-span-full text-center text-xs text-slate-400 py-8">
                   このゾーンに選択できるカードがありません
                 </p>
@@ -1863,20 +2191,22 @@ function BattleRoomContent() {
               🔄 「{revolutionChangePending.card.name}」と革命チェンジする場のキャラを選択（手札に戻ります）
             </h3>
             <div className="grid grid-cols-2 gap-2">
-              {battleZone.map((c) => (
-                <button
-                  key={c.instanceId}
-                  onClick={() => handleExecuteRevolutionChange(c)}
-                  className="p-2 rounded text-xs font-bold flex items-center gap-2 bg-fuchsia-700 hover:bg-fuchsia-600"
-                >
-                  {c.imageUrl && (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
-                  )}
-                  <span className="truncate">{c.name}</span>
-                </button>
-              ))}
-              {battleZone.length === 0 && (
+              {battleZone
+                .filter((c) => !c.kindanRole)
+                .map((c) => (
+                  <button
+                    key={c.instanceId}
+                    onClick={() => handleExecuteRevolutionChange(c)}
+                    className="p-2 rounded text-xs font-bold flex items-center gap-2 bg-fuchsia-700 hover:bg-fuchsia-600"
+                  >
+                    {c.imageUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                    )}
+                    <span className="truncate">{c.name}</span>
+                  </button>
+                ))}
+              {battleZone.filter((c) => !c.kindanRole).length === 0 && (
                 <p className="text-xs text-slate-400 col-span-2 py-3 text-center">
                   バトルゾーンにキャラがいません
                 </p>
@@ -1960,7 +2290,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 墓地全確認モーダル（墓地からの進化もここから起動可能） ================= */}
+      {/* ================= 墓地全確認モーダル ================= */}
       {!isSpectator && graveSearchOpen && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
           <div className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3">

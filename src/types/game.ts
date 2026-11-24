@@ -1,5 +1,7 @@
 export type Civilization = 'fire' | 'water' | 'nature' | 'light' | 'darkness' | 'zero';
 
+export type KindanType = 'none' | 'dokindam' | 'dormageddon';
+
 export interface CardData {
   id: string;
   name: string;
@@ -10,12 +12,11 @@ export interface CardData {
   text: string;
   isShieldTrigger?: boolean;
   imageUrl?: string;
-  // AI審判用の能力メタデータ（後続ステップでAIが自動付与）
   aiEffects?: {
-    onPlayLookDeck?: number; // 登場時に山札の上から見る枚数（例: 4）
-    onPlayText?: string; // 登場時効果の要約
-    onAttackEvolution?: boolean; // 攻撃時に進化・チェンジ可能か
-    onAttackText?: string; // 攻撃時効果の要約
+    onPlayLookDeck?: number;
+    onPlayText?: string;
+    onAttackEvolution?: boolean;
+    onAttackText?: string;
   };
 }
 
@@ -24,12 +25,15 @@ export interface CardInstance extends CardData {
   tapped: boolean;
   faceUp: boolean;
   underCards: CardInstance[];
+  kindanRole?: 'dokindam' | 'dormageddon';
+  kindanAwakened?: boolean;
 }
 
 export interface PlayerState {
   id: string;
   name: string;
   deckId: string;
+  kindanType?: KindanType;
   deck: CardInstance[];
   hand: CardInstance[];
   mana: CardInstance[];

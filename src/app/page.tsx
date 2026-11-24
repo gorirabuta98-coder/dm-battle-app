@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { ref, set, get, onValue, remove } from 'firebase/database';
 import { db } from '@/lib/firebase';
 import { DeckPreset } from '@/data/decks';
-import { CardData, CardInstance, GameRoom } from '@/types/game';
+import { CardData, CardInstance, GameRoom, KindanType } from '@/types/game';
 
 function createDeckInstances(cards: CardData[]): CardInstance[] {
   const instances: CardInstance[] = cards.map((card, index) => ({
@@ -22,15 +22,53 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
   return instances;
 }
 
+function createKindanCard(kindanType: KindanType, seals: CardInstance[]): CardInstance | null {
+  if (kindanType === 'dokindam') {
+    return {
+      instanceId: `kindan-dokindam-${Math.random().toString(36).substring(2, 7)}`,
+      id: 'kindan-dokindam-x',
+      name: '禁断 ～封印されしX～ / 伝説の禁断 ドキンダムX',
+      cost: 99,
+      civilization: ['fire'],
+      type: 'creature',
+      power: 99999,
+      text: '【禁断の鼓動】ゲーム開始時、このカードを封印を6つ付けてバトルゾーンに置く。コマンドを出した時、封印を1つ墓地に置く。封印がすべてなくなった時、裏返して「伝説の禁断 ドキンダムX」に禁断解放する。',
+      tapped: false,
+      faceUp: true,
+      underCards: seals,
+      kindanRole: 'dokindam',
+      kindanAwakened: false,
+    };
+  }
+  if (kindanType === 'dormageddon') {
+    return {
+      instanceId: `kindan-dormageddon-${Math.random().toString(36).substring(2, 7)}`,
+      id: 'kindan-dormageddon-x',
+      name: 'FORBIDDEN STAR ～世界最後の日～ / 終焉の禁断 ドルマゲドンX',
+      cost: 99,
+      civilization: ['fire', 'darkness'],
+      type: 'creature',
+      power: 99999,
+      text: '【禁断爆発】ゲーム開始時、封印を4つ付けてバトルゾーンに置く。封印がすべてなくなった時、裏返して「終焉の禁断 ドルマゲドンX」に禁断爆発する。',
+      tapped: false,
+      faceUp: true,
+      underCards: seals,
+      kindanRole: 'dormageddon',
+      kindanAwakened: false,
+    };
+  }
+  return null;
+}
+
 export default function HomePage() {
   const router = useRouter();
   const [playerName, setPlayerName] = useState('');
   const [customDecks, setCustomDecks] = useState<DeckPreset[]>([]);
   const [selectedDeckId, setSelectedDeckId] = useState<string>('');
+  const [selectedKindan, setSelectedKindan] = useState<KindanType>('none');
   const [joinRoomId, setJoinRoomId] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // 直前まで入っていた部屋へのワンタップ復帰用
   const [lastActiveRoom, setLastActiveRoom] = useState<{
     roomId: string;
     playerId: string;
@@ -41,7 +79,6 @@ export default function HomePage() {
     const savedName = localStorage.getItem('dm_player_name') || '';
     if (savedName) setPlayerName(savedName);
 
-    // 前回参加していた部屋がまだ生存しているかチェックして復帰ボタンを出す
     const savedRoomId = localStorage.getItem('dm_last_room_id');
     const savedPlayerId = localStorage.getItem('dm_player_id');
     if (savedRoomId && savedPlayerId && !savedPlayerId.startsWith('spectator_')) {
@@ -92,27 +129,44 @@ export default function HomePage() {
     }
   };
 
-  // 初期盤面（山札40枚→シールド5枚・手札5枚・残り30枚山札）を生成するヘルパー
-  const buildInitialPlayerState = (playerId: string, name: string, deckPreset: DeckPreset) => {
+  // 初期盤面生成（シールド5枚・手札5枚 ＋ ドキンダムXなら封印6枚 / ドルマゲドンXなら封印4枚）
+  const buildInitialPlayerState = (
+    playerId: string,
+    name: string,
+    deckPreset: DeckPreset,
+    kindanType: KindanType
+  ) => {
     const allCards = createDeckInstances(deckPreset.cards);
     const shields = allCards.slice(0, 5).map((c) => ({ ...c, faceUp: false }));
     const hand = allCards.slice(5, 10).map((c) => ({ ...c, faceUp: true }));
-    const deck = allCards.slice(10);
+
+    const sealCount =
+      kindanType === 'dokindam' ? 6 : kindanType === 'dormageddon' ? 4 : 0;
+    const seals = allCards
+      .slice(10, 10 + sealCount)
+      .map((c) => ({ ...c, faceUp: false, tapped: false }));
+    const deck = allCards.slice(10 + sealCount);
+
+    const initialBZ: CardInstance[] = [];
+    const kindanCard = createKindanCard(kindanType, seals);
+    if (kindanCard) {
+      initialBZ.push(kindanCard);
+    }
 
     return {
       id: playerId,
       name: name.trim(),
       deckId: deckPreset.id,
+      kindanType,
       deck,
       hand,
       mana: [],
       shields,
-      battleZone: [],
+      battleZone: initialBZ,
       graveyard: [],
     };
   };
 
-  // 部屋を作成して待機（ルームIDは数字3桁：100〜999）
   const handleCreateRoom = async () => {
     if (!playerName.trim()) return alert('プレイヤー名を入力してください');
     const deckPreset = customDecks.find((d) => d.id === selectedDeckId);
@@ -138,7 +192,12 @@ export default function HomePage() {
       localStorage.setItem('dm_player_name', playerName.trim());
       localStorage.setItem('dm_last_room_id', roomId);
 
-      const initialPlayer = buildInitialPlayerState(playerId, playerName.trim(), deckPreset);
+      const initialPlayer = buildInitialPlayerState(
+        playerId,
+        playerName.trim(),
+        deckPreset,
+        selectedKindan
+      );
 
       const newRoom: GameRoom = {
         roomId,
@@ -160,7 +219,6 @@ export default function HomePage() {
     }
   };
 
-  // 既存の部屋にプレイヤーとして参加（または切断からの自動復帰）
   const handleJoinRoom = async () => {
     if (!playerName.trim()) return alert('プレイヤー名を入力してください');
     const cleanRoomId = joinRoomId.trim();
@@ -182,8 +240,7 @@ export default function HomePage() {
       const existingPlayerIds = Object.keys(playersMap);
       const trimmedName = playerName.trim();
 
-      // 1. まず保存されていたIDが部屋に残っているか確認（そのまま復帰）
-      let savedId = localStorage.getItem('dm_player_id') || '';
+      const savedId = localStorage.getItem('dm_player_id') || '';
       if (savedId && existingPlayerIds.includes(savedId)) {
         localStorage.setItem('dm_player_name', trimmedName);
         localStorage.setItem('dm_last_room_id', cleanRoomId);
@@ -191,7 +248,6 @@ export default function HomePage() {
         return;
       }
 
-      // 2. 別ブラウザやキャッシュ消去でIDが変わっていても、同じプレイヤー名がいればその席へ自動復帰！
       const matchedByNameId = existingPlayerIds.find(
         (pid) => playersMap[pid]?.name?.trim() === trimmedName
       );
@@ -203,11 +259,10 @@ export default function HomePage() {
         return;
       }
 
-      // 3. 完全に新規のプレイヤー参加
       if (existingPlayerIds.length >= 2) {
         const namesList = existingPlayerIds.map((id) => playersMap[id]?.name).join(' / ');
         alert(
-          `この部屋はすでに2人（${namesList}）が対戦中です！\n\n・途中の試合に復帰する場合は、対戦時と同じプレイヤー名を入力して「対戦参加」を押してください。\n・観戦する場合は右の「👁️ 観戦する」を押してください。`
+          `この部屋はすでに2人（${namesList}）が対戦中です！\n\n・途中の試合に復帰する場合は、対戦時と同じプレイヤー名を入力して「対戦参加 / 復帰」を押してください。\n・観戦する場合は右の「👁️ 観戦する」を押してください。`
         );
         setLoading(false);
         return;
@@ -225,7 +280,12 @@ export default function HomePage() {
       localStorage.setItem('dm_player_name', trimmedName);
       localStorage.setItem('dm_last_room_id', cleanRoomId);
 
-      const joinPlayer = buildInitialPlayerState(newPlayerId, trimmedName, deckPreset);
+      const joinPlayer = buildInitialPlayerState(
+        newPlayerId,
+        trimmedName,
+        deckPreset,
+        selectedKindan
+      );
       await set(ref(db, `rooms/${cleanRoomId}/players/${newPlayerId}`), joinPlayer);
 
       router.push(`/room/${cleanRoomId}`);
@@ -237,7 +297,6 @@ export default function HomePage() {
     }
   };
 
-  // 3人目以降が試合を観戦する
   const handleSpectateRoom = async () => {
     const cleanRoomId = joinRoomId.trim();
     if (!cleanRoomId) return alert('観戦したい部屋の3桁ルームIDを入力してください');
@@ -266,7 +325,7 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-4">
-      <div className="w-full max-w-lg bg-slate-800 rounded-2xl shadow-xl p-6 space-y-6 border border-slate-700">
+      <div className="w-full max-w-lg bg-slate-800 rounded-2xl shadow-xl p-6 space-y-5 border border-slate-700">
         <div className="text-center space-y-1">
           <h1 className="text-2xl font-bold tracking-wider text-amber-400">
             DM ONLINE SIMULATOR
@@ -301,7 +360,7 @@ export default function HomePage() {
         )}
 
         {/* プレイヤー名 */}
-        <div className="space-y-2">
+        <div className="space-y-1.5">
           <label className="block text-sm font-medium text-slate-300">
             プレイヤー名（落ちた時は同じ名前で再入室できます）
           </label>
@@ -318,7 +377,7 @@ export default function HomePage() {
         <div className="space-y-2">
           <div className="flex justify-between items-center">
             <label className="block text-sm font-medium text-slate-300">
-              共有デッキ一覧 ({customDecks.length}個)
+              使用する40枚デッキ ({customDecks.length}個)
             </label>
             <button
               type="button"
@@ -343,7 +402,7 @@ export default function HomePage() {
               </button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-2 max-h-64 overflow-y-auto pr-1">
+            <div className="grid grid-cols-1 gap-2 max-h-52 overflow-y-auto pr-1">
               {customDecks.map((deck) => {
                 const isSelected = selectedDeckId === deck.id;
                 const coverImage = deck.cards?.[0]?.imageUrl;
@@ -403,6 +462,50 @@ export default function HomePage() {
           )}
         </div>
 
+        {/* 禁断カード（41枚目・初期封印セット）オプション */}
+        <div className="space-y-1.5 bg-slate-900/70 p-3 rounded-xl border border-rose-500/40">
+          <label className="block text-xs font-extrabold text-rose-300">
+            🔥 禁断カード（40枚デッキとは別の41枚目・初期封印配置）
+          </label>
+          <div className="grid grid-cols-3 gap-1.5 text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => setSelectedKindan('none')}
+              className={`py-2 px-2 rounded-lg border text-center transition ${
+                selectedKindan === 'none'
+                  ? 'bg-slate-600 border-white text-white'
+                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700'
+              }`}
+            >
+              なし（40枚）
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedKindan('dokindam')}
+              className={`py-2 px-1.5 rounded-lg border text-center transition ${
+                selectedKindan === 'dokindam'
+                  ? 'bg-rose-700 border-amber-400 text-white shadow'
+                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              🔥 ドキンダムX
+              <span className="block text-[9px] font-normal opacity-85">初期封印 6枚</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedKindan('dormageddon')}
+              className={`py-2 px-1.5 rounded-lg border text-center transition ${
+                selectedKindan === 'dormageddon'
+                  ? 'bg-purple-800 border-amber-400 text-white shadow'
+                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              💀 ドルマゲドンX
+              <span className="block text-[9px] font-normal opacity-85">初期封印 4枚</span>
+            </button>
+          </div>
+        </div>
+
         {/* 部屋を作る（数字3桁ID） */}
         <div className="pt-2 border-t border-slate-700 space-y-3">
           <button
@@ -417,7 +520,6 @@ export default function HomePage() {
             または数字3桁のIDで参加・復帰・観戦
           </div>
 
-          {/* 数字3桁ルームID入力 ＋ 対戦参加(復帰) ＋ 観戦ボタン */}
           <div className="flex flex-col sm:flex-row gap-2">
             <input
               type="text"
