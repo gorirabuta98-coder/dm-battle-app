@@ -22,9 +22,7 @@ export default function CutInOverlay({ event }: CutInOverlayProps) {
 
   useEffect(() => {
     if (!event) return;
-    // すでに自分が閉じたイベントなら再表示しない
     if (event.id === dismissedId) return;
-    // 30秒以上前の古いイベントは表示しない
     if (Date.now() - event.timestamp > 30000) return;
 
     setVisible(true);
@@ -68,17 +66,17 @@ export default function CutInOverlay({ event }: CutInOverlayProps) {
   return (
     <div
       onClick={handleClose}
-      className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 cursor-pointer transition-opacity duration-150"
+      className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-2 sm:p-4 cursor-pointer"
     >
       <div
         onClick={(e) => {
           e.stopPropagation();
           handleClose();
         }}
-        className={`bg-slate-900 border-2 ${badgeConfig.border} rounded-2xl p-4 sm:p-5 max-w-xs sm:max-w-sm w-full flex flex-col items-center space-y-3 shadow-2xl transition-transform duration-150 scale-100`}
+        className={`bg-slate-900 border-2 ${badgeConfig.border} rounded-2xl p-3 sm:p-4 max-w-md w-full max-h-[95vh] flex flex-col items-center justify-between space-y-2.5 shadow-2xl`}
       >
         {/* アクション種別＆プレイヤー名 */}
-        <div className="flex items-center justify-between w-full gap-2">
+        <div className="flex items-center justify-between w-full gap-2 shrink-0">
           <span className={`px-2.5 py-0.5 rounded text-xs font-extrabold ${badgeConfig.badgeBg}`}>
             {badgeConfig.label}
           </span>
@@ -87,22 +85,22 @@ export default function CutInOverlay({ event }: CutInOverlayProps) {
           </span>
         </div>
 
-        {/* カード画像をデカデカと表示 */}
+        {/* カード画像を画面いっぱいレベルにデカデカと表示 */}
         {event.imageUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={event.imageUrl}
             alt={event.cardName}
-            className="w-60 h-84 sm:w-64 sm:h-90 object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-xl"
+            className="w-[82vw] max-w-[380px] h-[62vh] max-h-[540px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl"
           />
         ) : (
-          <div className="w-56 h-72 bg-slate-800 rounded-xl border border-slate-600 flex items-center justify-center p-4 text-center font-bold text-lg">
+          <div className="w-[75vw] max-w-[320px] h-[50vh] bg-slate-800 rounded-xl border border-slate-600 flex items-center justify-center p-4 text-center font-bold text-xl">
             {event.cardName}
           </div>
         )}
 
         {/* カード名＆補足 */}
-        <div className="text-center space-y-0.5 w-full">
+        <div className="text-center space-y-0.5 w-full shrink-0">
           <div className="text-base sm:text-lg font-extrabold text-white truncate">
             {event.cardName}
           </div>
@@ -115,9 +113,9 @@ export default function CutInOverlay({ event }: CutInOverlayProps) {
         <button
           type="button"
           onClick={handleClose}
-          className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 active:bg-slate-500 text-white font-bold rounded-xl text-xs sm:text-sm transition"
+          className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 active:bg-slate-500 text-white font-bold rounded-xl text-xs sm:text-sm transition shrink-0"
         >
-          閉じる（画面タップでも閉じます）
+          閉じる（タップでも閉じます）
         </button>
       </div>
     </div>

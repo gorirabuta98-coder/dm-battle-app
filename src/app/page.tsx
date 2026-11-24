@@ -30,9 +30,35 @@ export default function HomePage() {
   const [joinRoomId, setJoinRoomId] = useState('');
   const [loading, setLoading] = useState(false);
 
+  // 直前まで入っていた部屋へのワンタップ復帰用
+  const [lastActiveRoom, setLastActiveRoom] = useState<{
+    roomId: string;
+    playerId: string;
+    playerName: string;
+  } | null>(null);
+
   useEffect(() => {
-    const savedName = localStorage.getItem('dm_player_name');
+    const savedName = localStorage.getItem('dm_player_name') || '';
     if (savedName) setPlayerName(savedName);
+
+    // 前回参加していた部屋がまだ生存しているかチェックして復帰ボタンを出す
+    const savedRoomId = localStorage.getItem('dm_last_room_id');
+    const savedPlayerId = localStorage.getItem('dm_player_id');
+    if (savedRoomId && savedPlayerId && !savedPlayerId.startsWith('spectator_')) {
+      get(ref(db, `rooms/${savedRoomId}`)).then((snap) => {
+        if (snap.exists()) {
+          const r = snap.val() as GameRoom;
+          if (r.players && r.players[savedPlayerId]) {
+            setLastActiveRoom({
+              roomId: savedRoomId,
+              playerId: savedPlayerId,
+              playerName: r.players[savedPlayerId].name || savedName,
+            });
+            setJoinRoomId(savedRoomId);
+          }
+        }
+      });
+    }
 
     const decksRef = ref(db, 'customDecks');
     const unsubscribe = onValue(decksRef, (snapshot) => {
@@ -94,7 +120,6 @@ export default function HomePage() {
 
     setLoading(true);
     try {
-      // 重複しない3桁の数字ID（100〜999）を生成
       let roomId = '';
       for (let attempt = 0; attempt < 15; attempt++) {
         const candidate = String(Math.floor(100 + Math.random() * 900));
@@ -111,6 +136,7 @@ export default function HomePage() {
       const playerId = 'p1_' + Math.random().toString(36).substring(2, 8);
       localStorage.setItem('dm_player_id', playerId);
       localStorage.setItem('dm_player_name', playerName.trim());
+      localStorage.setItem('dm_last_room_id', roomId);
 
       const initialPlayer = buildInitialPlayerState(playerId, playerName.trim(), deckPreset);
 
@@ -134,13 +160,11 @@ export default function HomePage() {
     }
   };
 
-  // 既存の部屋にプレイヤー2として参加
+  // 既存の部屋にプレイヤーとして参加（または切断からの自動復帰）
   const handleJoinRoom = async () => {
     if (!playerName.trim()) return alert('プレイヤー名を入力してください');
     const cleanRoomId = joinRoomId.trim();
     if (!cleanRoomId) return alert('3桁のルームIDを入力してください');
-    const deckPreset = customDecks.find((d) => d.id === selectedDeckId);
-    if (!deckPreset) return alert('先にデッキを作成して選択してください！');
 
     setLoading(true);
     try {
@@ -154,25 +178,55 @@ export default function HomePage() {
       }
 
       const roomData = snapshot.val() as GameRoom;
-      const existingPlayers = Object.keys(roomData.players || {});
+      const playersMap = roomData.players || {};
+      const existingPlayerIds = Object.keys(playersMap);
+      const trimmedName = playerName.trim();
 
-      let playerId = localStorage.getItem('dm_player_id') || '';
-      if (!playerId || !existingPlayers.includes(playerId)) {
-        if (existingPlayers.length >= 2) {
-          alert('この部屋はすでにプレイヤー2人が満員です！右の「観戦する」ボタンから観戦できます。');
-          setLoading(false);
-          return;
-        }
-        playerId = 'p2_' + Math.random().toString(36).substring(2, 8);
+      // 1. まず保存されていたIDが部屋に残っているか確認（そのまま復帰）
+      let savedId = localStorage.getItem('dm_player_id') || '';
+      if (savedId && existingPlayerIds.includes(savedId)) {
+        localStorage.setItem('dm_player_name', trimmedName);
+        localStorage.setItem('dm_last_room_id', cleanRoomId);
+        router.push(`/room/${cleanRoomId}`);
+        return;
       }
 
-      localStorage.setItem('dm_player_id', playerId);
-      localStorage.setItem('dm_player_name', playerName.trim());
-
-      if (!existingPlayers.includes(playerId)) {
-        const joinPlayer = buildInitialPlayerState(playerId, playerName.trim(), deckPreset);
-        await set(ref(db, `rooms/${cleanRoomId}/players/${playerId}`), joinPlayer);
+      // 2. 別ブラウザやキャッシュ消去でIDが変わっていても、同じプレイヤー名がいればその席へ自動復帰！
+      const matchedByNameId = existingPlayerIds.find(
+        (pid) => playersMap[pid]?.name?.trim() === trimmedName
+      );
+      if (matchedByNameId) {
+        localStorage.setItem('dm_player_id', matchedByNameId);
+        localStorage.setItem('dm_player_name', trimmedName);
+        localStorage.setItem('dm_last_room_id', cleanRoomId);
+        router.push(`/room/${cleanRoomId}`);
+        return;
       }
+
+      // 3. 完全に新規のプレイヤー参加
+      if (existingPlayerIds.length >= 2) {
+        const namesList = existingPlayerIds.map((id) => playersMap[id]?.name).join(' / ');
+        alert(
+          `この部屋はすでに2人（${namesList}）が対戦中です！\n\n・途中の試合に復帰する場合は、対戦時と同じプレイヤー名を入力して「対戦参加」を押してください。\n・観戦する場合は右の「👁️ 観戦する」を押してください。`
+        );
+        setLoading(false);
+        return;
+      }
+
+      const deckPreset = customDecks.find((d) => d.id === selectedDeckId);
+      if (!deckPreset) {
+        alert('先にデッキを作成して選択してください！');
+        setLoading(false);
+        return;
+      }
+
+      const newPlayerId = 'p2_' + Math.random().toString(36).substring(2, 8);
+      localStorage.setItem('dm_player_id', newPlayerId);
+      localStorage.setItem('dm_player_name', trimmedName);
+      localStorage.setItem('dm_last_room_id', cleanRoomId);
+
+      const joinPlayer = buildInitialPlayerState(newPlayerId, trimmedName, deckPreset);
+      await set(ref(db, `rooms/${cleanRoomId}/players/${newPlayerId}`), joinPlayer);
 
       router.push(`/room/${cleanRoomId}`);
     } catch (error) {
@@ -199,7 +253,6 @@ export default function HomePage() {
         return;
       }
 
-      // 観戦者用のIDをセット（プレイヤー一覧には登録せず閲覧専用で入る）
       const specId = 'spectator_' + Math.random().toString(36).substring(2, 8);
       localStorage.setItem('dm_player_id', specId);
       router.push(`/room/${cleanRoomId}?spectate=1`);
@@ -223,10 +276,34 @@ export default function HomePage() {
           </p>
         </div>
 
+        {/* 試合落ちからのワンタップ復帰バナー */}
+        {lastActiveRoom && (
+          <div className="p-3 bg-emerald-950/90 border-2 border-emerald-400 rounded-xl flex items-center justify-between gap-2 shadow-lg">
+            <div className="min-w-0">
+              <div className="text-xs font-extrabold text-emerald-300">
+                ⚡ 進行中の対戦部屋が見つかりました
+              </div>
+              <div className="text-[11px] text-slate-300 truncate">
+                部屋ID: <span className="font-mono font-bold text-white">{lastActiveRoom.roomId}</span>（{lastActiveRoom.playerName}）
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                localStorage.setItem('dm_player_id', lastActiveRoom.playerId);
+                router.push(`/room/${lastActiveRoom.roomId}`);
+              }}
+              className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold rounded-lg text-xs shrink-0 transition"
+            >
+              試合に復帰する
+            </button>
+          </div>
+        )}
+
         {/* プレイヤー名 */}
         <div className="space-y-2">
           <label className="block text-sm font-medium text-slate-300">
-            プレイヤー名（対戦参加時に必要）
+            プレイヤー名（落ちた時は同じ名前で再入室できます）
           </label>
           <input
             type="text"
@@ -336,9 +413,11 @@ export default function HomePage() {
             {loading ? '通信中...' : '新しく対戦部屋を作る（数字3桁ID発行）'}
           </button>
 
-          <div className="text-center text-xs text-slate-400">または数字3桁のIDで参加・観戦</div>
+          <div className="text-center text-xs text-slate-400">
+            または数字3桁のIDで参加・復帰・観戦
+          </div>
 
-          {/* 数字3桁ルームID入力 ＋ 対戦参加 ＋ 観戦ボタン */}
+          {/* 数字3桁ルームID入力 ＋ 対戦参加(復帰) ＋ 観戦ボタン */}
           <div className="flex flex-col sm:flex-row gap-2">
             <input
               type="text"
@@ -351,10 +430,10 @@ export default function HomePage() {
             />
             <button
               onClick={handleJoinRoom}
-              disabled={loading || customDecks.length === 0}
+              disabled={loading}
               className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 font-bold rounded-lg transition text-sm"
             >
-              対戦参加
+              対戦参加 / 復帰
             </button>
             <button
               onClick={handleSpectateRoom}

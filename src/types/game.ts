@@ -56,4 +56,8 @@ export interface GameRoom {
     timestamp: number;
   } | null;
   inspectingText?: string | null;
+  publicReveal?: {
+    playerName: string;
+    cards: CardInstance[];
+  } | null;
 }
