@@ -1,8 +1,8 @@
 'use client';
 
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { ref, onValue, update, get, remove } from 'firebase/database';
+import { ref, onValue, update, get, remove, set } from 'firebase/database';
 import { db } from '@/lib/firebase';
 import { CardData, CardInstance, GameRoom, KindanType, PlayerState } from '@/types/game';
 import { DeckPreset } from '@/data/decks';
@@ -14,6 +14,66 @@ type EvolutionSourceZone = 'battleZone' | 'mana' | 'graveyard' | 'hand' | 'deck'
 interface SelectedEvolutionMaterial {
   card: CardInstance;
   sourceZone: EvolutionSourceZone;
+}
+
+// ターンエンド＆ターン交代時の効果音（Web Audio APIで2音チャイムを鳴らす）
+function playTurnEndSound() {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    const ctx = new AudioCtx();
+    if (ctx.state === 'suspended') {
+      ctx.resume();
+    }
+
+    const now = ctx.currentTime;
+    const notes = [587.33, 880.0]; // D5 -> A5 の爽やかなターン交代チャイム
+
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.11);
+
+      gain.gain.setValueAtTime(0.001, now + idx * 0.11);
+      gain.gain.exponentialRampToValueAtTime(0.22, now + idx * 0.11 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.11 + 0.38);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(now + idx * 0.11);
+      osc.stop(now + idx * 0.11 + 0.4);
+    });
+  } catch (e) {
+    console.warn('Sound playback skipped:', e);
+  }
+}
+
+function compressImageToDataUrl(file: File, maxWidth = 420): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxWidth / img.width);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return reject(new Error('Canvas error'));
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.onerror = reject;
+      img.src = reader.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 function createDeckInstances(cards: CardData[]): CardInstance[] {
@@ -31,7 +91,12 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
   return instances;
 }
 
-function createKindanCard(kindanType: KindanType | undefined, seals: CardInstance[]): CardInstance | null {
+function createKindanCard(
+  kindanType: KindanType | undefined,
+  seals: CardInstance[],
+  frontImageUrl?: string,
+  backImageUrl?: string
+): CardInstance | null {
   if (kindanType === 'dokindam') {
     return {
       instanceId: `kindan-dokindam-${Math.random().toString(36).substring(2, 7)}`,
@@ -42,6 +107,8 @@ function createKindanCard(kindanType: KindanType | undefined, seals: CardInstanc
       type: 'creature',
       power: 99999,
       text: '【禁断の鼓動】ゲーム開始時、封印を6つ付けてバトルゾーンに置く。コマンドを出した時、封印を1つ墓地に置く。封印がすべてなくなった時、裏返して「伝説の禁断 ドキンダムX」に禁断解放する。',
+      imageUrl: frontImageUrl || '',
+      kindanAwakenedImageUrl: backImageUrl || frontImageUrl || '',
       tapped: false,
       faceUp: true,
       underCards: seals,
@@ -59,6 +126,8 @@ function createKindanCard(kindanType: KindanType | undefined, seals: CardInstanc
       type: 'creature',
       power: 99999,
       text: '【禁断爆発】ゲーム開始時、封印を4つ付けてバトルゾーンに置く。封印がすべてなくなった時、裏返して「終焉の禁断 ドルマゲドンX」に禁断爆発する。',
+      imageUrl: frontImageUrl || '',
+      kindanAwakenedImageUrl: backImageUrl || frontImageUrl || '',
       tapped: false,
       faceUp: true,
       underCards: seals,
@@ -77,6 +146,17 @@ function BattleRoomContent() {
 
   const [room, setRoom] = useState<GameRoom | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
+  const [spectatorShowHands, setSpectatorShowHands] = useState<boolean>(true);
+  const [isEvolvingBusy, setIsEvolvingBusy] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+
+  const prevTurnCountRef = useRef<number | null>(null);
+  const prevTurnPlayerRef = useRef<string | null>(null);
+  const soundEnabledRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
 
   const [selectedCard, setSelectedCard] = useState<{
     card: CardInstance;
@@ -94,6 +174,7 @@ function BattleRoomContent() {
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [deckSearchOpen, setDeckSearchOpen] = useState(false);
   const [graveSearchOpen, setGraveSearchOpen] = useState(false);
+  const [oppGraveViewOpen, setOppGraveViewOpen] = useState(false);
   const [peekCount, setPeekCount] = useState<number>(4);
 
   const [peekState, setPeekState] = useState<{
@@ -129,12 +210,16 @@ function BattleRoomContent() {
     subText?: string
   ) => {
     if (!roomId) return;
+    const displayImg =
+      card.kindanRole && card.kindanAwakened && card.kindanAwakenedImageUrl
+        ? card.kindanAwakenedImageUrl
+        : card.imageUrl;
     const event: CutInEvent = {
       id: Math.random().toString(36).substring(2, 9),
       type,
       playerName,
       cardName: card.name,
-      imageUrl: card.imageUrl,
+      imageUrl: displayImg,
       subText,
       timestamp: Date.now(),
     };
@@ -151,7 +236,23 @@ function BattleRoomContent() {
     const roomRef = ref(db, `rooms/${roomId}`);
     const unsubscribe = onValue(roomRef, (snapshot) => {
       if (snapshot.exists()) {
-        setRoom(snapshot.val() as GameRoom);
+        const data = snapshot.val() as GameRoom;
+
+        // ターンエンド（ターン数増加またはターンプレイヤー交代）を検知して音を鳴らす
+        if (
+          prevTurnCountRef.current !== null &&
+          prevTurnPlayerRef.current !== null &&
+          (data.turnCount > prevTurnCountRef.current ||
+            data.turnPlayerId !== prevTurnPlayerRef.current)
+        ) {
+          if (soundEnabledRef.current) {
+            playTurnEndSound();
+          }
+        }
+        prevTurnCountRef.current = data.turnCount;
+        prevTurnPlayerRef.current = data.turnPlayerId;
+
+        setRoom(data);
       } else {
         alert('部屋が見つかりません');
         router.push('/');
@@ -203,7 +304,7 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), newState);
   };
 
-  // 【禁断専用】封印を1枚外す（墓地へ送る）／山札から封印を1枚乗せる／禁断解放（裏返す）
+  // 【禁断専用】封印を1枚外す（墓地へ送る）／山札から封印を1枚乗せる／禁断解放（裏返す）／裏面画像アップロード
   const handleRemoveOneSeal = async (kindanCard: CardInstance) => {
     if (!me || isSpectator) return;
     const seals = kindanCard.underCards || [];
@@ -301,6 +402,48 @@ function BattleRoomContent() {
     }
   };
 
+  const handleUploadKindanImageInRoom = async (
+    kindanCard: CardInstance,
+    side: 'front' | 'back',
+    file?: File
+  ) => {
+    if (!me || isSpectator || !file) return;
+    try {
+      const dataUrl = await compressImageToDataUrl(file);
+      const updatedKindan: CardInstance = {
+        ...kindanCard,
+        ...(side === 'front'
+          ? { imageUrl: dataUrl }
+          : { kindanAwakenedImageUrl: dataUrl, kindanAwakened: true }),
+      };
+      const nextBZ = (me.battleZone || []).map((c) =>
+        c.instanceId === kindanCard.instanceId ? updatedKindan : c
+      );
+
+      await updateMyState({
+        battleZone: nextBZ,
+        ...(side === 'front'
+          ? { kindanFrontImageUrl: dataUrl }
+          : { kindanBackImageUrl: dataUrl }),
+      });
+
+      const sharedKey =
+        kindanCard.kindanRole === 'dokindam'
+          ? side === 'front'
+            ? 'dokindamFront'
+            : 'dokindamBack'
+          : side === 'front'
+          ? 'dormageddonFront'
+          : 'dormageddonBack';
+      await set(ref(db, `sharedKindanImages/${sharedKey}`), dataUrl);
+
+      setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
+    } catch (e) {
+      console.error(e);
+      alert('画像の読み込みに失敗しました');
+    }
+  };
+
   // 相手のクリーチャーを新しい表向きシールドとして相手シールドゾーンに追加
   const handleSendOpponentCardToFaceUpShield = async (
     targetCard: CardInstance,
@@ -371,7 +514,7 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), restored);
   };
 
-  // 【試合リセット】ドキンダムX / ドルマゲドンXの初期封印も含めて完全に最初からやり直す
+  // 【試合リセット】ドキンダムX / ドルマゲドンXの初期封印＆表裏画像も含めて完全に最初からやり直す
   const handleResetMatch = async () => {
     if (isSpectator) return;
     if (
@@ -385,6 +528,8 @@ function BattleRoomContent() {
     setResetting(true);
     try {
       const updatedPlayers: Record<string, PlayerState> = {};
+      const sharedSnap = await get(ref(db, 'sharedKindanImages'));
+      const sharedImgs = sharedSnap.exists() ? sharedSnap.val() : {};
 
       for (const pid of playerIds) {
         const p = playersObj[pid];
@@ -426,8 +571,20 @@ function BattleRoomContent() {
           .map((c) => ({ ...c, faceUp: false, tapped: false }));
         const deck = shuffled.slice(10 + sealCount);
 
+        const existingKindan = (p.battleZone || []).find((c) => c.kindanRole);
+        const frontImg =
+          p.kindanFrontImageUrl ||
+          existingKindan?.imageUrl ||
+          (kType === 'dokindam' ? sharedImgs.dokindamFront : sharedImgs.dormageddonFront) ||
+          '';
+        const backImg =
+          p.kindanBackImageUrl ||
+          existingKindan?.kindanAwakenedImageUrl ||
+          (kType === 'dokindam' ? sharedImgs.dokindamBack : sharedImgs.dormageddonBack) ||
+          '';
+
         const initialBZ: CardInstance[] = [];
-        const kindanCard = createKindanCard(kType, seals);
+        const kindanCard = createKindanCard(kType, seals, frontImg, backImg);
         if (kindanCard) {
           initialBZ.push(kindanCard);
         }
@@ -479,6 +636,13 @@ function BattleRoomContent() {
   const oppShields = opponent?.shields || [];
   const oppBattleZone = opponent?.battleZone || [];
   const oppGraveyard = opponent?.graveyard || [];
+
+  // バトルゾーンを「通常クリーチャー」と「右端固定の禁断カード」に分離
+  const normalBattleZone = battleZone.filter((c) => !c.kindanRole);
+  const kindanBattleZone = battleZone.find((c) => c.kindanRole);
+
+  const oppNormalBattleZone = oppBattleZone.filter((c) => !c.kindanRole);
+  const oppKindanBattleZone = oppBattleZone.find((c) => c.kindanRole);
 
   const handleTopDeckTo = async (dest: 'hand' | 'mana' | 'graveyard' | 'shields') => {
     if (!me || isSpectator || deck.length === 0) return alert('山札がありません');
@@ -574,7 +738,8 @@ function BattleRoomContent() {
     if (dest === 'hand') {
       await updateMyState({ hand: [...hand, updatedCard] });
     } else if (dest === 'battleZone') {
-      await updateMyState({ battleZone: [...battleZone, updatedCard] });
+      const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
+      await updateMyState({ battleZone: [...cleanBZ, updatedCard] });
       await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
     } else if (dest === 'mana') {
       await updateMyState({ mana: [...mana, updatedCard] });
@@ -655,7 +820,10 @@ function BattleRoomContent() {
 
     if (toZone === 'hand') nextHand.push(cleanCard);
     if (toZone === 'mana') nextMana.push(cleanCard);
-    if (toZone === 'battleZone') nextBZ.push(cleanCard);
+    if (toZone === 'battleZone') {
+      nextBZ = removeFrom(nextBZ);
+      nextBZ.push(cleanCard);
+    }
     if (toZone === 'shields' || toZone === 'shieldsFaceUp') nextShields.push(cleanCard);
     if (toZone === 'graveyard') nextGrave.push(cleanCard);
     if (toZone === 'deckTop') nextDeck.unshift(cleanCard);
@@ -744,106 +912,117 @@ function BattleRoomContent() {
     });
   };
 
+  // ★ 進化確定処理（二重発火・複製バグを完全防止）
   const handleConfirmFreeEvolution = async () => {
-    if (!me || isSpectator || !evolutionBuilder) return;
+    if (!me || isSpectator || !evolutionBuilder || isEvolvingBusy) return;
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
 
     if (selectedMaterials.length === 0) {
       return alert('進化元（下に敷くカード）を1枚以上選んでください');
     }
 
-    let nextDeck = [...deck];
-    let nextHand = [...hand];
-    let nextMana = [...mana];
-    let nextGrave = [...graveyard];
-    let nextBZ = [...battleZone];
+    setIsEvolvingBusy(true);
+    try {
+      let nextDeck = [...deck];
+      let nextHand = [...hand];
+      let nextMana = [...mana];
+      let nextGrave = [...graveyard];
+      let nextBZ = [...battleZone].filter((c) => c.instanceId !== evolvingCard.instanceId);
 
-    if (fromZone === 'hand') {
-      nextHand = nextHand.filter((c) => c.instanceId !== evolvingCard.instanceId);
-    } else if (fromZone === 'mana') {
-      nextMana = nextMana.filter((c) => c.instanceId !== evolvingCard.instanceId);
-    } else if (fromZone === 'graveyard') {
-      nextGrave = nextGrave.filter((c) => c.instanceId !== evolvingCard.instanceId);
-    }
+      if (fromZone === 'hand') {
+        nextHand = nextHand.filter((c) => c.instanceId !== evolvingCard.instanceId);
+      } else if (fromZone === 'mana') {
+        nextMana = nextMana.filter((c) => c.instanceId !== evolvingCard.instanceId);
+      } else if (fromZone === 'graveyard') {
+        nextGrave = nextGrave.filter((c) => c.instanceId !== evolvingCard.instanceId);
+      }
 
-    const collectedUnderCards: CardInstance[] = [];
-    let inheritedTapState = false;
-    let firstBZAnchorId: string | null = null;
-    const bzIdsToRemove = new Set<string>();
+      const collectedUnderCards: CardInstance[] = [];
+      let inheritedTapState = false;
+      let firstBZAnchorId: string | null = null;
+      const bzIdsToRemove = new Set<string>();
 
-    for (const mat of selectedMaterials) {
-      if (mat.sourceZone === 'battleZone') {
-        const found = nextBZ.find((c) => c.instanceId === mat.card.instanceId);
-        if (found) {
-          if (!firstBZAnchorId) {
-            firstBZAnchorId = found.instanceId;
-            inheritedTapState = found.tapped;
-          } else {
-            bzIdsToRemove.add(found.instanceId);
+      for (const mat of selectedMaterials) {
+        if (mat.sourceZone === 'battleZone') {
+          const found = nextBZ.find((c) => c.instanceId === mat.card.instanceId);
+          if (found) {
+            if (!firstBZAnchorId) {
+              firstBZAnchorId = found.instanceId;
+              inheritedTapState = found.tapped;
+            } else {
+              bzIdsToRemove.add(found.instanceId);
+            }
+            if (found.underCards && found.underCards.length > 0) {
+              collectedUnderCards.push(
+                ...found.underCards.map((u) => ({
+                  ...u,
+                  tapped: false,
+                  faceUp: true,
+                  underCards: [],
+                }))
+              );
+            }
+            collectedUnderCards.push({ ...found, tapped: false, faceUp: true, underCards: [] });
           }
-          if (found.underCards && found.underCards.length > 0) {
-            collectedUnderCards.push(
-              ...found.underCards.map((u) => ({ ...u, tapped: false, faceUp: true, underCards: [] }))
-            );
-          }
-          collectedUnderCards.push({ ...found, tapped: false, faceUp: true, underCards: [] });
+        } else if (mat.sourceZone === 'mana') {
+          nextMana = nextMana.filter((c) => c.instanceId !== mat.card.instanceId);
+          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+        } else if (mat.sourceZone === 'graveyard') {
+          nextGrave = nextGrave.filter((c) => c.instanceId !== mat.card.instanceId);
+          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+        } else if (mat.sourceZone === 'hand') {
+          nextHand = nextHand.filter((c) => c.instanceId !== mat.card.instanceId);
+          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+        } else if (mat.sourceZone === 'deck') {
+          nextDeck = nextDeck.filter((c) => c.instanceId !== mat.card.instanceId);
+          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
         }
-      } else if (mat.sourceZone === 'mana') {
-        nextMana = nextMana.filter((c) => c.instanceId !== mat.card.instanceId);
-        collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
-      } else if (mat.sourceZone === 'graveyard') {
-        nextGrave = nextGrave.filter((c) => c.instanceId !== mat.card.instanceId);
-        collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
-      } else if (mat.sourceZone === 'hand') {
-        nextHand = nextHand.filter((c) => c.instanceId !== mat.card.instanceId);
-        collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
-      } else if (mat.sourceZone === 'deck') {
-        nextDeck = nextDeck.filter((c) => c.instanceId !== mat.card.instanceId);
-        collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
       }
-    }
 
-    const evolvedCard: CardInstance = {
-      ...evolvingCard,
-      tapped: inheritedTapState,
-      faceUp: true,
-      underCards: collectedUnderCards,
-    };
+      const evolvedCard: CardInstance = {
+        ...evolvingCard,
+        tapped: inheritedTapState,
+        faceUp: true,
+        underCards: collectedUnderCards,
+      };
 
-    if (firstBZAnchorId) {
-      nextBZ = nextBZ
-        .filter((c) => !bzIdsToRemove.has(c.instanceId))
-        .map((c) => (c.instanceId === firstBZAnchorId ? evolvedCard : c));
-    } else {
-      nextBZ.push(evolvedCard);
-    }
-
-    const usedDeck = selectedMaterials.some((m) => m.sourceZone === 'deck');
-    if (usedDeck && nextDeck.length > 1) {
-      for (let i = nextDeck.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [nextDeck[i], nextDeck[j]] = [nextDeck[j], nextDeck[i]];
+      if (firstBZAnchorId) {
+        nextBZ = nextBZ
+          .filter((c) => !bzIdsToRemove.has(c.instanceId))
+          .map((c) => (c.instanceId === firstBZAnchorId ? evolvedCard : c));
+      } else {
+        nextBZ.push(evolvedCard);
       }
+
+      const usedDeck = selectedMaterials.some((m) => m.sourceZone === 'deck');
+      if (usedDeck && nextDeck.length > 1) {
+        for (let i = nextDeck.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [nextDeck[i], nextDeck[j]] = [nextDeck[j], nextDeck[i]];
+        }
+      }
+
+      const sourceNames = selectedMaterials.map((m) => m.card.name).join('・');
+      setEvolutionBuilder(null);
+      setSelectedCard(null);
+
+      await updateMyState({
+        deck: nextDeck,
+        hand: nextHand,
+        mana: nextMana,
+        graveyard: nextGrave,
+        battleZone: nextBZ,
+      });
+
+      await triggerCutIn(
+        'evolution',
+        me.name,
+        evolvedCard,
+        `進化！（下敷き ${selectedMaterials.length}枚：${sourceNames}）`
+      );
+    } finally {
+      setIsEvolvingBusy(false);
     }
-
-    await updateMyState({
-      deck: nextDeck,
-      hand: nextHand,
-      mana: nextMana,
-      graveyard: nextGrave,
-      battleZone: nextBZ,
-    });
-
-    const sourceNames = selectedMaterials.map((m) => m.card.name).join('・');
-    setEvolutionBuilder(null);
-    setSelectedCard(null);
-
-    await triggerCutIn(
-      'evolution',
-      me.name,
-      evolvedCard,
-      `進化！（下敷き ${selectedMaterials.length}枚：${sourceNames}）`
-    );
   };
 
   const handleExecuteRevolutionChange = async (targetCard: CardInstance) => {
@@ -880,9 +1059,9 @@ function BattleRoomContent() {
       underCards: [],
     };
 
-    const nextBZ = battleZone.map((c) =>
-      c.instanceId === targetCard.instanceId ? changedCard : c
-    );
+    const nextBZ = battleZone
+      .filter((c) => c.instanceId !== incomingCard.instanceId)
+      .map((c) => (c.instanceId === targetCard.instanceId ? changedCard : c));
 
     await updateMyState({
       hand: nextHand,
@@ -942,7 +1121,8 @@ function BattleRoomContent() {
     if (toZone === 'hand') {
       await updateMyState({ deck: nextDeck, hand: [...hand, updatedCard] });
     } else if (toZone === 'battleZone') {
-      await updateMyState({ deck: nextDeck, battleZone: [...battleZone, updatedCard] });
+      const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
+      await updateMyState({ deck: nextDeck, battleZone: [...cleanBZ, updatedCard] });
       await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
     } else if (toZone === 'mana') {
       await updateMyState({ deck: nextDeck, mana: [...mana, updatedCard] });
@@ -953,18 +1133,27 @@ function BattleRoomContent() {
     }
   };
 
-  // カード表示コンポーネント（ドキンダムX / ドルマゲドンX専用グラフィック＆封印枚数表示付き）
+  // カード表示コンポーネント（ドキンダムX / ドルマゲドンX 表裏画像＆封印枚数表示対応）
   const renderCard = (
     card: CardInstance,
     zone: ZoneType,
     isControllable: boolean,
     ownerName: string,
-    index?: number
+    index?: number,
+    forceHideFaceForSpectator = false
   ) => {
-    const showFace = card.faceUp || (isControllable && zone === 'hand');
+    const showFace = forceHideFaceForSpectator
+      ? false
+      : card.faceUp || (isControllable && zone === 'hand') || (isSpectator && zone === 'hand');
     const underCount = card.underCards?.length || 0;
     const canClick = isControllable || showFace;
     const isKindan = !!card.kindanRole;
+
+    const kindanDisplayImage = isKindan
+      ? card.kindanAwakened
+        ? card.kindanAwakenedImageUrl || card.imageUrl
+        : card.imageUrl
+      : card.imageUrl;
 
     return (
       <div
@@ -1012,7 +1201,7 @@ function BattleRoomContent() {
           setSelectedCard({ card, zone });
         }}
         title={showFace ? `${card.name}（タップで操作・拡大）` : '裏向きカード'}
-        className={`relative select-none transition-transform ${
+        className={`relative select-none transition-transform shrink-0 ${
           canClick ? 'cursor-pointer active:scale-95' : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
           underCount > 0 ? 'mt-2 ml-1.5' : ''
@@ -1046,23 +1235,46 @@ function BattleRoomContent() {
           }`}
         >
           {isKindan ? (
-            <div className="p-1 flex flex-col justify-between items-center h-full text-center">
-              <span
-                className={`w-full text-[8px] font-extrabold px-1 rounded ${
-                  card.kindanAwakened
-                    ? 'bg-yellow-300 text-slate-950'
-                    : 'bg-rose-600 text-white'
-                }`}
-              >
-                {card.kindanAwakened ? '🔥 禁断解放！' : '🔒 鼓動 / 封印中'}
-              </span>
-              <div className="text-[9px] sm:text-[10px] font-extrabold leading-tight line-clamp-2 text-amber-200">
-                {card.kindanRole === 'dokindam' ? 'ドキンダムX' : 'ドルマゲドンX'}
+            kindanDisplayImage ? (
+              <>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={kindanDisplayImage}
+                  alt={card.name}
+                  className="w-full h-full object-cover"
+                />
+                <span
+                  className={`absolute top-0.5 left-0.5 right-0.5 text-center text-[8px] font-extrabold px-1 rounded shadow ${
+                    card.kindanAwakened
+                      ? 'bg-yellow-300 text-slate-950'
+                      : 'bg-rose-600/95 text-white'
+                  }`}
+                >
+                  {card.kindanAwakened ? '🔥 禁断解放！' : '🔒 鼓動 / 封印中'}
+                </span>
+                <span className="absolute bottom-0.5 left-0.5 right-0.5 text-center bg-black/85 border border-amber-400/80 text-amber-300 text-[9px] font-extrabold py-0.5 rounded">
+                  封印 {underCount}枚
+                </span>
+              </>
+            ) : (
+              <div className="p-1 flex flex-col justify-between items-center h-full text-center">
+                <span
+                  className={`w-full text-[8px] font-extrabold px-1 rounded ${
+                    card.kindanAwakened
+                      ? 'bg-yellow-300 text-slate-950'
+                      : 'bg-rose-600 text-white'
+                  }`}
+                >
+                  {card.kindanAwakened ? '🔥 禁断解放！' : '🔒 鼓動 / 封印中'}
+                </span>
+                <div className="text-[9px] sm:text-[10px] font-extrabold leading-tight line-clamp-2 text-amber-200">
+                  {card.kindanRole === 'dokindam' ? 'ドキンダムX' : 'ドルマゲドンX'}
+                </div>
+                <span className="w-full bg-black/80 border border-amber-400/70 text-amber-300 text-[9px] font-extrabold py-0.5 rounded">
+                  封印 {underCount}枚
+                </span>
               </div>
-              <span className="w-full bg-black/80 border border-amber-400/70 text-amber-300 text-[9px] font-extrabold py-0.5 rounded">
-                封印 {underCount}枚
-              </span>
-            </div>
+            )
           ) : showFace ? (
             card.imageUrl ? (
               <>
@@ -1096,7 +1308,9 @@ function BattleRoomContent() {
               </div>
             )
           ) : (
-            <span className="text-xs font-bold">{zone === 'shields' ? `S${(index ?? 0) + 1}` : 'DM'}</span>
+            <span className="text-xs font-bold">
+              {zone === 'shields' ? `S${(index ?? 0) + 1}` : 'DM'}
+            </span>
           )}
         </div>
       </div>
@@ -1139,9 +1353,18 @@ function BattleRoomContent() {
             ID: {room.roomId}
           </span>
           {isSpectator && (
-            <span className="text-xs bg-indigo-600 px-2.5 py-1 rounded font-bold text-white">
-              👁️ 観戦モード
-            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs bg-indigo-600 px-2.5 py-1 rounded font-bold text-white">
+                👁️ 観戦モード
+              </span>
+              <button
+                type="button"
+                onClick={() => setSpectatorShowHands((prev) => !prev)}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 border border-amber-400/70 text-amber-300 rounded text-xs font-bold"
+              >
+                {spectatorShowHands ? '🙈 両方の手札を隠す' : '👁️ 両方の手札を見る'}
+              </button>
+            </div>
           )}
           <span className="text-xs sm:text-sm font-bold">
             ターン {room.turnCount}：
@@ -1156,6 +1379,23 @@ function BattleRoomContent() {
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const next = !soundEnabled;
+              setSoundEnabled(next);
+              if (next) playTurnEndSound();
+            }}
+            title="ターンエンド効果音のON/OFF"
+            className={`px-2.5 py-1.5 rounded text-xs font-bold border transition ${
+              soundEnabled
+                ? 'bg-slate-800 hover:bg-slate-700 border-amber-400/60 text-amber-300'
+                : 'bg-slate-900 border-slate-700 text-slate-500'
+            }`}
+          >
+            {soundEnabled ? '🔊 音ON' : '🔇 音OFF'}
+          </button>
+
           {!isSpectator && (
             <>
               <button
@@ -1193,11 +1433,9 @@ function BattleRoomContent() {
 
               if (!isSpectator && roomId && myPlayerId) {
                 try {
-                  // 自分の退室記録を保存
                   await update(ref(db, `rooms/${roomId}/leftPlayers`), {
                     [myPlayerId]: true,
                   });
-                  // 全員が退室したか確認して、全員いなくなったら部屋を完全削除
                   const snap = await get(ref(db, `rooms/${roomId}`));
                   if (snap.exists()) {
                     const data = snap.val();
@@ -1268,19 +1506,48 @@ function BattleRoomContent() {
 
       {/* ================= 上側フィールド（相手 または プレイヤー1） ================= */}
       <section className="bg-slate-900/60 border border-slate-800 rounded-xl p-2 sm:p-3 space-y-2 my-1">
-        <div className="flex justify-between items-center text-xs text-slate-400">
+        <div className="flex flex-wrap justify-between items-center gap-2 text-xs text-slate-400">
           <span className="font-bold text-rose-300">
             {isSpectator ? 'プレイヤー1' : '相手'}：{opponent ? opponent.name : '参加待ち...'}
           </span>
-          <div className="flex gap-3">
+          <div className="flex items-center gap-3">
             <span>山札: {oppDeck.length}</span>
             <span>手札: {oppHand.length}</span>
             <span>マナ: {oppMana.length}</span>
-            <span>墓地: {oppGraveyard.length}</span>
+            {opponent && (
+              <button
+                type="button"
+                onClick={() => setOppGraveViewOpen(true)}
+                className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-rose-500/50 rounded text-rose-300 font-bold"
+              >
+                墓地: {oppGraveyard.length}（見る）
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-1 min-h-[32px] bg-slate-950/50 p-1.5 rounded">
+        {/* 観戦モード専用：プレイヤー1の手札表示 */}
+        {isSpectator && opponent && (
+          <div className="bg-slate-950/90 p-2 rounded-lg border border-indigo-500/40">
+            <div className="text-[10px] text-rose-300 font-bold mb-1">
+              {opponent.name}の手札 ({oppHand.length}枚)
+            </div>
+            <div className="flex flex-wrap gap-1.5 min-h-[68px]">
+              {oppHand.map((c) =>
+                renderCard(
+                  c,
+                  'hand',
+                  false,
+                  opponent.name,
+                  undefined,
+                  !spectatorShowHands
+                )
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-1 min-h-[32px] bg-slate-950/50 p-1.5 rounded items-center">
           <span className="text-[10px] text-slate-500 mr-1">マナ:</span>
           {oppMana.map((c) => renderCard(c, 'mana', false, opponent?.name || '相手'))}
         </div>
@@ -1294,12 +1561,20 @@ function BattleRoomContent() {
           )}
         </div>
 
-        <div className="flex flex-wrap gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded items-center">
-          <span className="text-[10px] text-slate-400 mr-1">
-            バトルゾーン (タップで能力拡大＆シールド送り):
-          </span>
-          {oppBattleZone.map((c) =>
-            renderCard(c, 'battleZone', false, opponent?.name || '相手')
+        {/* 相手バトルゾーン（通常クリーチャー左、禁断カード右端固定） */}
+        <div className="flex items-center justify-between gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded">
+          <div className="flex flex-wrap gap-2 items-center flex-1">
+            <span className="text-[10px] text-slate-400 mr-1">
+              バトルゾーン (タップで能力拡大＆シールド送り):
+            </span>
+            {oppNormalBattleZone.map((c) =>
+              renderCard(c, 'battleZone', false, opponent?.name || '相手')
+            )}
+          </div>
+          {oppKindanBattleZone && (
+            <div className="pl-2 border-l border-rose-500/40 shrink-0">
+              {renderCard(oppKindanBattleZone, 'battleZone', false, opponent?.name || '相手')}
+            </div>
           )}
         </div>
       </section>
@@ -1307,22 +1582,38 @@ function BattleRoomContent() {
       {/* ================= 下側フィールド（自分 または プレイヤー2） ================= */}
       <section className="bg-slate-900 border border-slate-700 rounded-xl p-2 sm:p-3 space-y-2 my-1">
         {isSpectator && (
-          <div className="flex justify-between items-center text-xs text-slate-400">
+          <div className="flex flex-wrap justify-between items-center gap-2 text-xs text-slate-400">
             <span className="font-bold text-emerald-300">
               プレイヤー2：{me ? me.name : '参加待ち...'}
             </span>
-            <div className="flex gap-3">
+            <div className="flex items-center gap-3">
               <span>山札: {deck.length}</span>
               <span>手札: {hand.length}</span>
               <span>マナ: {mana.length}</span>
-              <span>墓地: {graveyard.length}</span>
+              <button
+                type="button"
+                onClick={() => setGraveSearchOpen(true)}
+                className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-emerald-500/50 rounded text-emerald-300 font-bold"
+              >
+                墓地: {graveyard.length}（見る）
+              </button>
             </div>
           </div>
         )}
 
-        <div className="flex flex-wrap gap-2 min-h-[85px] bg-slate-800/60 p-2 rounded items-center">
-          <span className="text-[10px] text-emerald-400 font-bold mr-1">バトルゾーン:</span>
-          {battleZone.map((c) => renderCard(c, 'battleZone', !isSpectator, me?.name || '自分'))}
+        {/* 自分バトルゾーン（通常クリーチャー左、禁断カード右端固定） */}
+        <div className="flex items-center justify-between gap-2 min-h-[85px] bg-slate-800/60 p-2 rounded">
+          <div className="flex flex-wrap gap-2 items-center flex-1">
+            <span className="text-[10px] text-emerald-400 font-bold mr-1">バトルゾーン:</span>
+            {normalBattleZone.map((c) =>
+              renderCard(c, 'battleZone', !isSpectator, me?.name || '自分')
+            )}
+          </div>
+          {kindanBattleZone && (
+            <div className="pl-2 border-l border-amber-500/40 shrink-0">
+              {renderCard(kindanBattleZone, 'battleZone', !isSpectator, me?.name || '自分')}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950/60 p-2 rounded">
@@ -1437,7 +1728,16 @@ function BattleRoomContent() {
               : `自分の手札 (${hand.length}枚) - タップで超拡大＆マナ置き・召喚・進化・革命チェンジ`}
           </div>
           <div className="flex flex-wrap gap-2 min-h-[90px]">
-            {hand.map((c) => renderCard(c, 'hand', !isSpectator, me?.name || '自分'))}
+            {hand.map((c) =>
+              renderCard(
+                c,
+                'hand',
+                !isSpectator,
+                me?.name || '自分',
+                undefined,
+                isSpectator && !spectatorShowHands
+              )
+            )}
           </div>
         </div>
       </section>
@@ -1537,10 +1837,20 @@ function BattleRoomContent() {
               <span className="truncate max-w-[200px] text-amber-300">{inspectCard.card.name}</span>
             </div>
 
-            {inspectCard.card.imageUrl ? (
+            {(inspectCard.card.kindanRole &&
+            inspectCard.card.kindanAwakened &&
+            inspectCard.card.kindanAwakenedImageUrl
+              ? inspectCard.card.kindanAwakenedImageUrl
+              : inspectCard.card.imageUrl) ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
-                src={inspectCard.card.imageUrl}
+                src={
+                  inspectCard.card.kindanRole &&
+                  inspectCard.card.kindanAwakened &&
+                  inspectCard.card.kindanAwakenedImageUrl
+                    ? inspectCard.card.kindanAwakenedImageUrl
+                    : inspectCard.card.imageUrl
+                }
                 alt={inspectCard.card.name}
                 onClick={() => setInspectCard(null)}
                 className="w-[80vw] max-w-[360px] h-[56vh] max-h-[500px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl cursor-pointer"
@@ -1727,7 +2037,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル（ドキンダムX / ドルマゲドンX専用操作付き） ================= */}
+      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル（ドキンダムX / ドルマゲドンX専用操作＆裏返し画像設定付き） ================= */}
       {!isSpectator && selectedCard && (
         <div
           onClick={() => setSelectedCard(null)}
@@ -1737,13 +2047,23 @@ function BattleRoomContent() {
             onClick={(e) => e.stopPropagation()}
             className="bg-slate-900 border border-slate-500 rounded-2xl p-3 sm:p-4 max-w-md w-full max-h-[95vh] overflow-y-auto space-y-2.5 shadow-2xl"
           >
-            {selectedCard.card.imageUrl && (
+            {(selectedCard.card.kindanRole &&
+            selectedCard.card.kindanAwakened &&
+            selectedCard.card.kindanAwakenedImageUrl
+              ? selectedCard.card.kindanAwakenedImageUrl
+              : selectedCard.card.imageUrl) && (
               <div className="flex justify-center">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={selectedCard.card.imageUrl}
+                  src={
+                    selectedCard.card.kindanRole &&
+                    selectedCard.card.kindanAwakened &&
+                    selectedCard.card.kindanAwakenedImageUrl
+                      ? selectedCard.card.kindanAwakenedImageUrl
+                      : selectedCard.card.imageUrl
+                  }
                   alt={selectedCard.card.name}
-                  className="w-[78vw] max-w-[350px] h-[50vh] max-h-[450px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-xl"
+                  className="w-[78vw] max-w-[350px] h-[46vh] max-h-[420px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-xl"
                 />
               </div>
             )}
@@ -1774,7 +2094,7 @@ function BattleRoomContent() {
               )}
             </div>
 
-            {/* ドキンダムX / ドルマゲドンX 専用の封印取り外し＆禁断解放パネル */}
+            {/* ドキンダムX / ドルマゲドンX 専用の封印取り外し＆禁断解放＆表裏画像設定パネル */}
             {selectedCard.card.kindanRole && (
               <div className="bg-rose-950/70 border border-rose-500/60 rounded-xl p-2.5 space-y-2">
                 <div className="text-[11px] font-bold text-rose-200 text-center">
@@ -1810,6 +2130,40 @@ function BattleRoomContent() {
                     ? '🔥 禁断解放！（伝説の禁断 ドキンダムXに裏返す）'
                     : '💀 禁断爆発！（終焉の禁断 ドルマゲドンXに裏返す）'}
                 </button>
+
+                {/* 部屋内から表画像・裏返り画像を直接セット／変更可能 */}
+                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-rose-500/30 text-[11px] font-bold">
+                  <label className="py-1.5 px-2 bg-sky-700 hover:bg-sky-600 text-white rounded-lg text-center cursor-pointer">
+                    📷 鼓動面(表)画像
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) =>
+                        handleUploadKindanImageInRoom(
+                          selectedCard.card,
+                          'front',
+                          e.target.files?.[0]
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="py-1.5 px-2 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded-lg text-center cursor-pointer font-extrabold">
+                    📷 解放後(裏)画像
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) =>
+                        handleUploadKindanImageInRoom(
+                          selectedCard.card,
+                          'back',
+                          e.target.files?.[0]
+                        )
+                      }
+                    />
+                  </label>
+                </div>
               </div>
             )}
 
@@ -1846,7 +2200,7 @@ function BattleRoomContent() {
                       setEvolutionBuilder({
                         evolvingCard: selectedCard.card,
                         fromZone: 'hand',
-                        activeTab: battleZone.length > 0 ? 'battleZone' : 'mana',
+                        activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'mana',
                         selectedMaterials: [],
                       });
                       setSelectedCard(null);
@@ -1895,7 +2249,7 @@ function BattleRoomContent() {
                       setEvolutionBuilder({
                         evolvingCard: selectedCard.card,
                         fromZone: 'mana',
-                        activeTab: battleZone.length > 0 ? 'battleZone' : 'mana',
+                        activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'mana',
                         selectedMaterials: [],
                       });
                       setSelectedCard(null);
@@ -2014,14 +2368,16 @@ function BattleRoomContent() {
                       手札へ
                     </button>
                   )}
-                  {selectedCard.zone !== 'battleZone' && selectedCard.zone !== 'hand' && selectedCard.zone !== 'mana' && (
-                    <button
-                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'battleZone')}
-                      className="py-2 bg-amber-600 hover:bg-amber-500 rounded"
-                    >
-                      場へ出す
-                    </button>
-                  )}
+                  {selectedCard.zone !== 'battleZone' &&
+                    selectedCard.zone !== 'hand' &&
+                    selectedCard.zone !== 'mana' && (
+                      <button
+                        onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'battleZone')}
+                        className="py-2 bg-amber-600 hover:bg-amber-500 rounded"
+                      >
+                        場へ出す
+                      </button>
+                    )}
                   {selectedCard.zone !== 'mana' && selectedCard.zone !== 'hand' && (
                     <button
                       onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'mana')}
@@ -2103,7 +2459,7 @@ function BattleRoomContent() {
             <div className="flex flex-wrap gap-1.5 border-b border-slate-700 pb-2 text-xs font-bold">
               {(
                 [
-                  { id: 'battleZone', label: `バトルゾーン (${battleZone.filter((c) => !c.kindanRole).length})` },
+                  { id: 'battleZone', label: `バトルゾーン (${normalBattleZone.length})` },
                   { id: 'mana', label: `マナ (${mana.length})` },
                   { id: 'graveyard', label: `墓地 (${graveyard.length})` },
                   { id: 'hand', label: `手札 (${hand.length})` },
@@ -2200,7 +2556,7 @@ function BattleRoomContent() {
               </button>
               <button
                 onClick={handleConfirmFreeEvolution}
-                disabled={evolutionBuilder.selectedMaterials.length === 0}
+                disabled={evolutionBuilder.selectedMaterials.length === 0 || isEvolvingBusy}
                 className="flex-[2] py-2.5 bg-purple-600 hover:bg-purple-500 disabled:bg-slate-800 disabled:text-slate-500 rounded-xl text-xs sm:text-sm font-extrabold"
               >
                 🧬 選んだ {evolutionBuilder.selectedMaterials.length} 枚の上に進化して場に出す！
@@ -2218,22 +2574,20 @@ function BattleRoomContent() {
               🔄 「{revolutionChangePending.card.name}」と革命チェンジする場のキャラを選択（手札に戻ります）
             </h3>
             <div className="grid grid-cols-2 gap-2">
-              {battleZone
-                .filter((c) => !c.kindanRole)
-                .map((c) => (
-                  <button
-                    key={c.instanceId}
-                    onClick={() => handleExecuteRevolutionChange(c)}
-                    className="p-2 rounded text-xs font-bold flex items-center gap-2 bg-fuchsia-700 hover:bg-fuchsia-600"
-                  >
-                    {c.imageUrl && (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
-                    )}
-                    <span className="truncate">{c.name}</span>
-                  </button>
-                ))}
-              {battleZone.filter((c) => !c.kindanRole).length === 0 && (
+              {normalBattleZone.map((c) => (
+                <button
+                  key={c.instanceId}
+                  onClick={() => handleExecuteRevolutionChange(c)}
+                  className="p-2 rounded text-xs font-bold flex items-center gap-2 bg-fuchsia-700 hover:bg-fuchsia-600"
+                >
+                  {c.imageUrl && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                  )}
+                  <span className="truncate">{c.name}</span>
+                </button>
+              ))}
+              {normalBattleZone.length === 0 && (
                 <p className="text-xs text-slate-400 col-span-2 py-3 text-center">
                   バトルゾーンにキャラがいません
                 </p>
@@ -2317,12 +2671,14 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 墓地全確認モーダル ================= */}
-      {!isSpectator && graveSearchOpen && (
+      {/* ================= 自分の墓地全確認モーダル（観戦時はプレイヤー2の墓地閲覧） ================= */}
+      {graveSearchOpen && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
           <div className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3">
             <div className="flex justify-between items-center">
-              <h3 className="font-bold text-sm text-rose-300">墓地の中身 ({graveyard.length}枚)</h3>
+              <h3 className="font-bold text-sm text-rose-300">
+                {me?.name || '自分'}の墓地の中身 ({graveyard.length}枚)
+              </h3>
               <button
                 onClick={() => setGraveSearchOpen(false)}
                 className="px-3 py-1 bg-slate-700 rounded text-xs"
@@ -2349,46 +2705,92 @@ function BattleRoomContent() {
                       )}
                       <div className="font-bold text-xs truncate underline">{c.name}</div>
                     </div>
-                    <div className="flex flex-wrap gap-1 shrink-0 text-[10px] font-bold">
-                      <button
-                        onClick={() => moveCard(c, 'graveyard', 'hand')}
-                        className="px-2 py-1 bg-sky-600 hover:bg-sky-500 rounded"
-                      >
-                        手札
-                      </button>
-                      <button
-                        onClick={() => moveCard(c, 'graveyard', 'battleZone')}
-                        className="px-2 py-1 bg-amber-600 hover:bg-amber-500 rounded"
-                      >
-                        場
-                      </button>
-                      <button
-                        onClick={() => {
-                          setGraveSearchOpen(false);
-                          setEvolutionBuilder({
-                            evolvingCard: c,
-                            fromZone: 'graveyard',
-                            activeTab: battleZone.length > 0 ? 'battleZone' : 'graveyard',
-                            selectedMaterials: [],
-                          });
-                        }}
-                        className="px-2 py-1 bg-purple-600 hover:bg-purple-500 rounded"
-                      >
-                        進化
-                      </button>
-                      <button
-                        onClick={() => moveCard(c, 'graveyard', 'mana')}
-                        className="px-2 py-1 bg-lime-700 hover:bg-lime-600 rounded"
-                      >
-                        マナ
-                      </button>
-                      <button
-                        onClick={() => moveCard(c, 'graveyard', 'deckBottom')}
-                        className="px-2 py-1 bg-indigo-800 hover:bg-indigo-700 rounded"
-                      >
-                        山札下
-                      </button>
-                    </div>
+                    {!isSpectator && (
+                      <div className="flex flex-wrap gap-1 shrink-0 text-[10px] font-bold">
+                        <button
+                          onClick={() => moveCard(c, 'graveyard', 'hand')}
+                          className="px-2 py-1 bg-sky-600 hover:bg-sky-500 rounded"
+                        >
+                          手札
+                        </button>
+                        <button
+                          onClick={() => moveCard(c, 'graveyard', 'battleZone')}
+                          className="px-2 py-1 bg-amber-600 hover:bg-amber-500 rounded"
+                        >
+                          場
+                        </button>
+                        <button
+                          onClick={() => {
+                            setGraveSearchOpen(false);
+                            setEvolutionBuilder({
+                              evolvingCard: c,
+                              fromZone: 'graveyard',
+                              activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'graveyard',
+                              selectedMaterials: [],
+                            });
+                          }}
+                          className="px-2 py-1 bg-purple-600 hover:bg-purple-500 rounded"
+                        >
+                          進化
+                        </button>
+                        <button
+                          onClick={() => moveCard(c, 'graveyard', 'mana')}
+                          className="px-2 py-1 bg-lime-700 hover:bg-lime-600 rounded"
+                        >
+                          マナ
+                        </button>
+                        <button
+                          onClick={() => moveCard(c, 'graveyard', 'deckBottom')}
+                          className="px-2 py-1 bg-indigo-800 hover:bg-indigo-700 rounded"
+                        >
+                          山札下
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ================= 相手（プレイヤー1）の墓地確認モーダル（対戦中・観戦中どちらも閲覧可） ================= */}
+      {oppGraveViewOpen && opponent && (
+        <div
+          onClick={() => setOppGraveViewOpen(false)}
+          className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3"
+          >
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-sm text-rose-300">
+                {opponent.name}の墓地 ({oppGraveyard.length}枚)
+              </h3>
+              <button
+                onClick={() => setOppGraveViewOpen(false)}
+                className="px-3 py-1 bg-slate-700 rounded text-xs"
+              >
+                閉じる
+              </button>
+            </div>
+            {oppGraveyard.length === 0 ? (
+              <p className="text-xs text-slate-400 py-6 text-center">墓地にカードはありません</p>
+            ) : (
+              <div className="overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {oppGraveyard.map((c) => (
+                  <div
+                    key={c.instanceId}
+                    onClick={() => setInspectCard({ card: c, ownerName: opponent.name })}
+                    className="p-2 bg-slate-900 border border-slate-700 hover:border-amber-400 rounded flex items-center gap-2 cursor-pointer"
+                  >
+                    {c.imageUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                    )}
+                    <div className="font-bold text-xs truncate underline">{c.name}</div>
                   </div>
                 ))}
               </div>
