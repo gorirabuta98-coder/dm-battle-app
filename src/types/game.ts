@@ -27,6 +27,7 @@ export interface CardInstance extends CardData {
   underCards: CardInstance[];
   kindanRole?: 'dokindam' | 'dormageddon';
   kindanAwakened?: boolean;
+  kindanAwakenedImageUrl?: string;
 }
 
 export interface PlayerState {
@@ -34,6 +35,8 @@ export interface PlayerState {
   name: string;
   deckId: string;
   kindanType?: KindanType;
+  kindanFrontImageUrl?: string;
+  kindanBackImageUrl?: string;
   deck: CardInstance[];
   hand: CardInstance[];
   mana: CardInstance[];
@@ -47,6 +50,10 @@ export interface GameRoom {
   status: 'waiting' | 'playing' | 'finished';
   turnPlayerId: string;
   turnCount: number;
+  createdAt?: number;
+  leftPlayers?: {
+    [playerId: string]: boolean;
+  };
   players: {
     [playerId: string]: PlayerState;
   };

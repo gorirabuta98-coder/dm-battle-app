@@ -22,7 +22,35 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
   return instances;
 }
 
-function createKindanCard(kindanType: KindanType, seals: CardInstance[]): CardInstance | null {
+function compressImageToDataUrl(file: File, maxWidth = 420): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxWidth / img.width);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return reject(new Error('Canvas error'));
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.onerror = reject;
+      img.src = reader.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function createKindanCard(
+  kindanType: KindanType,
+  seals: CardInstance[],
+  frontImageUrl?: string,
+  backImageUrl?: string
+): CardInstance | null {
   if (kindanType === 'dokindam') {
     return {
       instanceId: `kindan-dokindam-${Math.random().toString(36).substring(2, 7)}`,
@@ -32,7 +60,9 @@ function createKindanCard(kindanType: KindanType, seals: CardInstance[]): CardIn
       civilization: ['fire'],
       type: 'creature',
       power: 99999,
-      text: '【禁断の鼓動】ゲーム開始時、このカードを封印を6つ付けてバトルゾーンに置く。コマンドを出した時、封印を1つ墓地に置く。封印がすべてなくなった時、裏返して「伝説の禁断 ドキンダムX」に禁断解放する。',
+      text: '【禁断の鼓動】ゲーム開始時、封印を6つ付けてバトルゾーンに置く。コマンドを出した時、封印を1つ墓地に置く。封印がすべてなくなった時、裏返して「伝説の禁断 ドキンダムX」に禁断解放する。',
+      imageUrl: frontImageUrl || '',
+      kindanAwakenedImageUrl: backImageUrl || frontImageUrl || '',
       tapped: false,
       faceUp: true,
       underCards: seals,
@@ -50,6 +80,8 @@ function createKindanCard(kindanType: KindanType, seals: CardInstance[]): CardIn
       type: 'creature',
       power: 99999,
       text: '【禁断爆発】ゲーム開始時、封印を4つ付けてバトルゾーンに置く。封印がすべてなくなった時、裏返して「終焉の禁断 ドルマゲドンX」に禁断爆発する。',
+      imageUrl: frontImageUrl || '',
+      kindanAwakenedImageUrl: backImageUrl || frontImageUrl || '',
       tapped: false,
       faceUp: true,
       underCards: seals,
@@ -66,6 +98,19 @@ export default function HomePage() {
   const [customDecks, setCustomDecks] = useState<DeckPreset[]>([]);
   const [selectedDeckId, setSelectedDeckId] = useState<string>('');
   const [selectedKindan, setSelectedKindan] = useState<KindanType>('none');
+
+  const [kindanImages, setKindanImages] = useState<{
+    dokindamFront: string;
+    dokindamBack: string;
+    dormageddonFront: string;
+    dormageddonBack: string;
+  }>({
+    dokindamFront: '',
+    dokindamBack: '',
+    dormageddonFront: '',
+    dormageddonBack: '',
+  });
+
   const [joinRoomId, setJoinRoomId] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -75,24 +120,78 @@ export default function HomePage() {
     playerName: string;
   } | null>(null);
 
+  const clearLastActiveRoom = () => {
+    localStorage.removeItem('dm_last_room_id');
+    localStorage.removeItem('dm_last_room_ts');
+    setLastActiveRoom(null);
+    setJoinRoomId('');
+  };
+
   useEffect(() => {
     const savedName = localStorage.getItem('dm_player_name') || '';
     if (savedName) setPlayerName(savedName);
 
+    // 3時間以上前に作られた放置部屋をFirebaseから自動掃除
+    get(ref(db, 'rooms')).then((allSnap) => {
+      if (!allSnap.exists()) return;
+      const allRooms = allSnap.val() as Record<string, GameRoom>;
+      const now = Date.now();
+      Object.entries(allRooms).forEach(([rId, rVal]) => {
+        if (rVal?.createdAt && now - rVal.createdAt > 3 * 60 * 60 * 1000) {
+          remove(ref(db, `rooms/${rId}`));
+        }
+      });
+    });
+
+    try {
+      const savedKindanImgs = localStorage.getItem('dm_kindan_images');
+      if (savedKindanImgs) {
+        setKindanImages(JSON.parse(savedKindanImgs));
+      }
+    } catch {
+      // ignore
+    }
+
+    const kindanImgRef = ref(db, 'sharedKindanImages');
+    const unsubKindanImg = onValue(kindanImgRef, (snap) => {
+      if (snap.exists()) {
+        const val = snap.val();
+        setKindanImages((prev) => ({
+          dokindamFront: val.dokindamFront || prev.dokindamFront || '',
+          dokindamBack: val.dokindamBack || prev.dokindamBack || '',
+          dormageddonFront: val.dormageddonFront || prev.dormageddonFront || '',
+          dormageddonBack: val.dormageddonBack || prev.dormageddonBack || '',
+        }));
+      }
+    });
+
     const savedRoomId = localStorage.getItem('dm_last_room_id');
     const savedPlayerId = localStorage.getItem('dm_player_id');
-    if (savedRoomId && savedPlayerId && !savedPlayerId.startsWith('spectator_')) {
+    const savedRoomTs = Number(localStorage.getItem('dm_last_room_ts') || '0');
+    const isExpired = savedRoomTs > 0 && Date.now() - savedRoomTs > 3 * 60 * 60 * 1000;
+
+    if (isExpired) {
+      localStorage.removeItem('dm_last_room_id');
+      localStorage.removeItem('dm_last_room_ts');
+    } else if (savedRoomId && savedPlayerId && !savedPlayerId.startsWith('spectator_')) {
       get(ref(db, `rooms/${savedRoomId}`)).then((snap) => {
         if (snap.exists()) {
           const r = snap.val() as GameRoom;
-          if (r.players && r.players[savedPlayerId]) {
+          const alreadyLeft = r.leftPlayers?.[savedPlayerId];
+          if (r.status !== 'finished' && !alreadyLeft && r.players && r.players[savedPlayerId]) {
             setLastActiveRoom({
               roomId: savedRoomId,
               playerId: savedPlayerId,
               playerName: r.players[savedPlayerId].name || savedName,
             });
             setJoinRoomId(savedRoomId);
+          } else {
+            localStorage.removeItem('dm_last_room_id');
+            localStorage.removeItem('dm_last_room_ts');
           }
+        } else {
+          localStorage.removeItem('dm_last_room_id');
+          localStorage.removeItem('dm_last_room_ts');
         }
       });
     }
@@ -113,8 +212,28 @@ export default function HomePage() {
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      unsubKindanImg();
+    };
   }, []);
+
+  const handleUploadKindanImage = async (
+    key: 'dokindamFront' | 'dokindamBack' | 'dormageddonFront' | 'dormageddonBack',
+    file?: File
+  ) => {
+    if (!file) return;
+    try {
+      const dataUrl = await compressImageToDataUrl(file);
+      const updated = { ...kindanImages, [key]: dataUrl };
+      setKindanImages(updated);
+      localStorage.setItem('dm_kindan_images', JSON.stringify(updated));
+      await set(ref(db, `sharedKindanImages/${key}`), dataUrl);
+    } catch (error) {
+      console.error(error);
+      alert('画像の読み込みに失敗しました');
+    }
+  };
 
   const handleDeleteDeck = async (e: React.MouseEvent, deck: DeckPreset) => {
     e.stopPropagation();
@@ -129,7 +248,6 @@ export default function HomePage() {
     }
   };
 
-  // 初期盤面生成（シールド5枚・手札5枚 ＋ ドキンダムXなら封印6枚 / ドルマゲドンXなら封印4枚）
   const buildInitialPlayerState = (
     playerId: string,
     name: string,
@@ -147,8 +265,21 @@ export default function HomePage() {
       .map((c) => ({ ...c, faceUp: false, tapped: false }));
     const deck = allCards.slice(10 + sealCount);
 
+    const frontImg =
+      kindanType === 'dokindam'
+        ? kindanImages.dokindamFront
+        : kindanType === 'dormageddon'
+        ? kindanImages.dormageddonFront
+        : '';
+    const backImg =
+      kindanType === 'dokindam'
+        ? kindanImages.dokindamBack
+        : kindanType === 'dormageddon'
+        ? kindanImages.dormageddonBack
+        : '';
+
     const initialBZ: CardInstance[] = [];
-    const kindanCard = createKindanCard(kindanType, seals);
+    const kindanCard = createKindanCard(kindanType, seals, frontImg, backImg);
     if (kindanCard) {
       initialBZ.push(kindanCard);
     }
@@ -158,6 +289,8 @@ export default function HomePage() {
       name: name.trim(),
       deckId: deckPreset.id,
       kindanType,
+      kindanFrontImageUrl: frontImg,
+      kindanBackImageUrl: backImg,
       deck,
       hand,
       mana: [],
@@ -191,6 +324,7 @@ export default function HomePage() {
       localStorage.setItem('dm_player_id', playerId);
       localStorage.setItem('dm_player_name', playerName.trim());
       localStorage.setItem('dm_last_room_id', roomId);
+      localStorage.setItem('dm_last_room_ts', String(Date.now()));
 
       const initialPlayer = buildInitialPlayerState(
         playerId,
@@ -204,6 +338,7 @@ export default function HomePage() {
         status: 'waiting',
         turnPlayerId: playerId,
         turnCount: 1,
+        createdAt: Date.now(),
         players: {
           [playerId]: initialPlayer,
         },
@@ -244,6 +379,7 @@ export default function HomePage() {
       if (savedId && existingPlayerIds.includes(savedId)) {
         localStorage.setItem('dm_player_name', trimmedName);
         localStorage.setItem('dm_last_room_id', cleanRoomId);
+        localStorage.setItem('dm_last_room_ts', String(Date.now()));
         router.push(`/room/${cleanRoomId}`);
         return;
       }
@@ -255,6 +391,7 @@ export default function HomePage() {
         localStorage.setItem('dm_player_id', matchedByNameId);
         localStorage.setItem('dm_player_name', trimmedName);
         localStorage.setItem('dm_last_room_id', cleanRoomId);
+        localStorage.setItem('dm_last_room_ts', String(Date.now()));
         router.push(`/room/${cleanRoomId}`);
         return;
       }
@@ -279,6 +416,7 @@ export default function HomePage() {
       localStorage.setItem('dm_player_id', newPlayerId);
       localStorage.setItem('dm_player_name', trimmedName);
       localStorage.setItem('dm_last_room_id', cleanRoomId);
+      localStorage.setItem('dm_last_room_ts', String(Date.now()));
 
       const joinPlayer = buildInitialPlayerState(
         newPlayerId,
@@ -323,6 +461,8 @@ export default function HomePage() {
     }
   };
 
+  const selectedDeckObj = customDecks.find((d) => d.id === selectedDeckId);
+
   return (
     <main className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-lg bg-slate-800 rounded-2xl shadow-xl p-6 space-y-5 border border-slate-700">
@@ -335,7 +475,7 @@ export default function HomePage() {
           </p>
         </div>
 
-        {/* 試合落ちからのワンタップ復帰バナー */}
+        {/* 試合落ちからのワンタップ復帰バナー（✕ボタンでいつでも消去可能） */}
         {lastActiveRoom && (
           <div className="p-3 bg-emerald-950/90 border-2 border-emerald-400 rounded-xl flex items-center justify-between gap-2 shadow-lg">
             <div className="min-w-0">
@@ -346,16 +486,27 @@ export default function HomePage() {
                 部屋ID: <span className="font-mono font-bold text-white">{lastActiveRoom.roomId}</span>（{lastActiveRoom.playerName}）
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                localStorage.setItem('dm_player_id', lastActiveRoom.playerId);
-                router.push(`/room/${lastActiveRoom.roomId}`);
-              }}
-              className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold rounded-lg text-xs shrink-0 transition"
-            >
-              試合に復帰する
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  localStorage.setItem('dm_player_id', lastActiveRoom.playerId);
+                  localStorage.setItem('dm_last_room_ts', String(Date.now()));
+                  router.push(`/room/${lastActiveRoom.roomId}`);
+                }}
+                className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold rounded-lg text-xs transition"
+              >
+                試合に復帰する
+              </button>
+              <button
+                type="button"
+                onClick={clearLastActiveRoom}
+                title="この通知を消す"
+                className="w-8 h-8 bg-slate-800/90 hover:bg-rose-700 text-slate-300 hover:text-white rounded-lg text-xs font-extrabold flex items-center justify-center transition"
+              >
+                ✕
+              </button>
+            </div>
           </div>
         )}
 
@@ -402,7 +553,7 @@ export default function HomePage() {
               </button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-2 max-h-52 overflow-y-auto pr-1">
+            <div className="grid grid-cols-1 gap-2 max-h-48 overflow-y-auto pr-1">
               {customDecks.map((deck) => {
                 const isSelected = selectedDeckId === deck.id;
                 const coverImage = deck.cards?.[0]?.imageUrl;
@@ -462,49 +613,136 @@ export default function HomePage() {
           )}
         </div>
 
-        {/* 禁断カード（41枚目・初期封印セット）オプション */}
-        <div className="space-y-1.5 bg-slate-900/70 p-3 rounded-xl border border-rose-500/40">
-          <label className="block text-xs font-extrabold text-rose-300">
-            🔥 禁断カード（40枚デッキとは別の41枚目・初期封印配置）
-          </label>
-          <div className="grid grid-cols-3 gap-1.5 text-xs font-bold">
-            <button
-              type="button"
-              onClick={() => setSelectedKindan('none')}
-              className={`py-2 px-2 rounded-lg border text-center transition ${
-                selectedKindan === 'none'
-                  ? 'bg-slate-600 border-white text-white'
-                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700'
-              }`}
-            >
-              なし（40枚）
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedKindan('dokindam')}
-              className={`py-2 px-1.5 rounded-lg border text-center transition ${
-                selectedKindan === 'dokindam'
-                  ? 'bg-rose-700 border-amber-400 text-white shadow'
-                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
-              }`}
-            >
-              🔥 ドキンダムX
-              <span className="block text-[9px] font-normal opacity-85">初期封印 6枚</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedKindan('dormageddon')}
-              className={`py-2 px-1.5 rounded-lg border text-center transition ${
-                selectedKindan === 'dormageddon'
-                  ? 'bg-purple-800 border-amber-400 text-white shadow'
-                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
-              }`}
-            >
-              💀 ドルマゲドンX
-              <span className="block text-[9px] font-normal opacity-85">初期封印 4枚</span>
-            </button>
+        {/* 禁断カード設定 */}
+        {selectedDeckObj && (
+          <div className="bg-slate-900/80 border border-amber-500/40 rounded-xl p-3 space-y-2.5">
+            <div className="text-xs font-extrabold text-amber-300 flex items-center justify-between">
+              <span>🔥 禁断カード（40枚デッキとは別の41枚目・初期封印配置）</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 text-xs font-bold">
+              <button
+                type="button"
+                onClick={() => setSelectedKindan('none')}
+                className={`py-2 px-2 rounded-lg border text-center transition ${
+                  selectedKindan === 'none'
+                    ? 'bg-slate-600 border-white text-white'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700'
+                }`}
+              >
+                なし（40枚）
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedKindan('dokindam')}
+                className={`py-2 px-2 rounded-lg border text-center transition ${
+                  selectedKindan === 'dokindam'
+                    ? 'bg-rose-700 border-amber-400 text-white shadow'
+                    : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                }`}
+              >
+                🔥 ドキンダムX
+                <span className="block text-[9px] font-normal opacity-85">初期封印 6枚</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedKindan('dormageddon')}
+                className={`py-2 px-2 rounded-lg border text-center transition ${
+                  selectedKindan === 'dormageddon'
+                    ? 'bg-purple-800 border-amber-400 text-white shadow'
+                    : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                }`}
+              >
+                💀 ドルマゲドンX
+                <span className="block text-[9px] font-normal opacity-85">初期封印 4枚</span>
+              </button>
+            </div>
+
+            {selectedKindan !== 'none' && (
+              <div className="pt-2 border-t border-slate-700/80 grid grid-cols-2 gap-2.5 text-xs">
+                <div className="bg-slate-800/80 p-2 rounded-lg border border-slate-700 flex flex-col items-center space-y-1.5">
+                  <span className="text-[10px] font-bold text-slate-300">
+                    ① 鼓動面（封印中）の画像
+                  </span>
+                  {(selectedKindan === 'dokindam'
+                    ? kindanImages.dokindamFront
+                    : kindanImages.dormageddonFront) ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={
+                        selectedKindan === 'dokindam'
+                          ? kindanImages.dokindamFront
+                          : kindanImages.dormageddonFront
+                      }
+                      alt="鼓動面"
+                      className="w-16 h-22 object-cover rounded border border-amber-400"
+                    />
+                  ) : (
+                    <div className="w-16 h-22 bg-slate-900 rounded border border-dashed border-slate-600 flex items-center justify-center text-[10px] text-slate-400 text-center p-1">
+                      画像未設定
+                    </div>
+                  )}
+                  <label className="w-full py-1 px-2 bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-bold rounded text-center cursor-pointer">
+                    📷 画像を入れる
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) =>
+                        handleUploadKindanImage(
+                          selectedKindan === 'dokindam'
+                            ? 'dokindamFront'
+                            : 'dormageddonFront',
+                          e.target.files?.[0]
+                        )
+                      }
+                    />
+                  </label>
+                </div>
+
+                <div className="bg-slate-800/80 p-2 rounded-lg border border-slate-700 flex flex-col items-center space-y-1.5">
+                  <span className="text-[10px] font-bold text-amber-300">
+                    ② 禁断解放後（裏面）の画像
+                  </span>
+                  {(selectedKindan === 'dokindam'
+                    ? kindanImages.dokindamBack
+                    : kindanImages.dormageddonBack) ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={
+                        selectedKindan === 'dokindam'
+                          ? kindanImages.dokindamBack
+                          : kindanImages.dormageddonBack
+                      }
+                      alt="禁断解放面"
+                      className="w-16 h-22 object-cover rounded border border-amber-400"
+                    />
+                  ) : (
+                    <div className="w-16 h-22 bg-slate-900 rounded border border-dashed border-slate-600 flex items-center justify-center text-[10px] text-slate-400 text-center p-1">
+                      画像未設定
+                    </div>
+                  )}
+                  <label className="w-full py-1 px-2 bg-amber-600 hover:bg-amber-500 text-slate-950 text-[10px] font-extrabold rounded text-center cursor-pointer">
+                    📷 解放後画像を入れる
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) =>
+                        handleUploadKindanImage(
+                          selectedKindan === 'dokindam'
+                            ? 'dokindamBack'
+                            : 'dormageddonBack',
+                          e.target.files?.[0]
+                        )
+                      }
+                    />
+                  </label>
+                </div>
+              </div>
+            )}
           </div>
-        </div>
+        )}
 
         {/* 部屋を作る（数字3桁ID） */}
         <div className="pt-2 border-t border-slate-700 space-y-3">

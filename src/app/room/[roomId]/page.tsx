@@ -2,7 +2,7 @@
 
 import { Suspense, useEffect, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { ref, onValue, update, get } from 'firebase/database';
+import { ref, onValue, update, get, remove } from 'firebase/database';
 import { db } from '@/lib/firebase';
 import { CardData, CardInstance, GameRoom, KindanType, PlayerState } from '@/types/game';
 import { DeckPreset } from '@/data/decks';
@@ -1187,7 +1187,34 @@ function BattleRoomContent() {
             </>
           )}
           <button
-            onClick={() => router.push('/')}
+            onClick={async () => {
+              localStorage.removeItem('dm_last_room_id');
+              localStorage.removeItem('dm_last_room_ts');
+
+              if (!isSpectator && roomId && myPlayerId) {
+                try {
+                  // 自分の退室記録を保存
+                  await update(ref(db, `rooms/${roomId}/leftPlayers`), {
+                    [myPlayerId]: true,
+                  });
+                  // 全員が退室したか確認して、全員いなくなったら部屋を完全削除
+                  const snap = await get(ref(db, `rooms/${roomId}`));
+                  if (snap.exists()) {
+                    const data = snap.val();
+                    const pIds = Object.keys(data.players || {});
+                    const leftMap = data.leftPlayers || {};
+                    const allLeft = pIds.length > 0 && pIds.every((id) => leftMap[id]);
+                    if (allLeft) {
+                      await remove(ref(db, `rooms/${roomId}`));
+                    }
+                  }
+                } catch (e) {
+                  console.error(e);
+                }
+              }
+
+              router.push('/');
+            }}
             className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-xs text-slate-300"
           >
             退出
