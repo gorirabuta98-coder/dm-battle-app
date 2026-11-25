@@ -73,7 +73,7 @@ function DeckBuilderContent() {
 
   const totalCards = items.reduce((sum, item) => sum + item.count, 0);
 
-  // 1枚の画像ファイルを圧縮してDataURLに変換するヘルパー
+  // 1枚の画像ファイルを圧縮してDataURLに変換するヘルパー（高画質・テキスト鮮明版）
   const compressImageFile = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -81,13 +81,17 @@ function DeckBuilderContent() {
         const img = new Image();
         img.onload = () => {
           const canvas = document.createElement('canvas');
-          const maxHeight = 380;
-          const scale = maxHeight / img.height;
-          canvas.width = img.width * scale;
-          canvas.height = maxHeight;
+          const maxHeight = 960;
+          const scale = img.height > maxHeight ? maxHeight / img.height : 1;
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
           const ctx = canvas.getContext('2d');
-          ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-          resolve(canvas.toDataURL('image/jpeg', 0.82));
+          if (ctx) {
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          }
+          resolve(canvas.toDataURL('image/jpeg', 0.92));
         };
         img.onerror = reject;
         img.src = event.target?.result as string;
@@ -288,7 +292,7 @@ function DeckBuilderContent() {
           </div>
 
           <label className="block w-full py-3 bg-sky-600 hover:bg-sky-500 text-center font-bold rounded-lg cursor-pointer transition text-sm">
-            {uploading ? '画像を読み込み・圧縮中...' : '📁 フォルダ・写真から画像を一括選択する'}
+            {uploading ? '画像を読み込み・高画質処理中...' : '📁 フォルダ・写真から画像を一括選択する'}
             <input
               type="file"
               accept="image/*"
