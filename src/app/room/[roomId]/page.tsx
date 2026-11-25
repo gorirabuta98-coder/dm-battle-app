@@ -16,7 +16,10 @@ type SoundEventType =
   | 'shieldBreak'
   | 'directAttack'
   | 'block'
-  | 'revZeroTrigger';
+  | 'revZeroTrigger'
+  | 'summon'
+  | 'spell'
+  | 'kindanRelease';
 
 type BattleCardInstance = CardInstance & {
   ignored?: boolean;
@@ -36,8 +39,19 @@ interface PendingDirectAttack {
   timestamp: number;
 }
 
-// 各種効果音（Web Audio APIで外部ファイル不要・即再生）
-function playGameSound(type: SoundEventType) {
+// public/sounds/ 内のMP3ファイル名マッピング
+const SOUND_FILE_MAP: Partial<Record<SoundEventType, string>> = {
+  shieldBreak: '/sounds/ガラスが割れる1.mp3',
+  summon: '/sounds/シャキーン1.mp3',
+  revZeroTrigger: '/sounds/シャキーン1.mp3',
+  directAttack: '/sounds/爆発2.mp3',
+  spell: '/sounds/魔法陣を展開.mp3',
+  kindanRelease: '/sounds/地響き.mp3',
+  attack: '/sounds/大パンチ.mp3',
+};
+
+// 合成音フォールバック＆ターンエンド・ブロック音
+function playSynthFallback(type: SoundEventType) {
   try {
     const AudioCtx =
       window.AudioContext ||
@@ -67,69 +81,6 @@ function playGameSound(type: SoundEventType) {
         osc.start(now + idx * 0.11);
         osc.stop(now + idx * 0.11 + 0.4);
       });
-    } else if (type === 'attack') {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(760, now);
-      osc.frequency.exponentialRampToValueAtTime(110, now + 0.22);
-
-      gain.gain.setValueAtTime(0.001, now);
-      gain.gain.exponentialRampToValueAtTime(0.28, now + 0.015);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.26);
-
-      const sub = ctx.createOscillator();
-      const subGain = ctx.createGain();
-      sub.type = 'sine';
-      sub.frequency.setValueAtTime(160, now + 0.04);
-      sub.frequency.exponentialRampToValueAtTime(48, now + 0.28);
-      subGain.gain.setValueAtTime(0.32, now + 0.04);
-      subGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
-      sub.connect(subGain);
-      subGain.connect(ctx.destination);
-      sub.start(now + 0.04);
-      sub.stop(now + 0.31);
-    } else if (type === 'shieldBreak') {
-      const bufferSize = Math.floor(ctx.sampleRate * 0.32);
-      const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-      const output = noiseBuffer.getChannelData(0);
-      for (let i = 0; i < bufferSize; i++) {
-        output[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.08));
-      }
-      const whiteNoise = ctx.createBufferSource();
-      whiteNoise.buffer = noiseBuffer;
-
-      const filter = ctx.createBiquadFilter();
-      filter.type = 'highpass';
-      filter.frequency.setValueAtTime(1400, now);
-
-      const noiseGain = ctx.createGain();
-      noiseGain.gain.setValueAtTime(0.35, now);
-      noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
-
-      whiteNoise.connect(filter);
-      filter.connect(noiseGain);
-      noiseGain.connect(ctx.destination);
-      whiteNoise.start(now);
-
-      [1950, 2650, 3200].forEach((freq, i) => {
-        const shard = ctx.createOscillator();
-        const sGain = ctx.createGain();
-        shard.type = 'square';
-        shard.frequency.setValueAtTime(freq, now + i * 0.03);
-        shard.frequency.exponentialRampToValueAtTime(freq * 0.6, now + i * 0.03 + 0.12);
-        sGain.gain.setValueAtTime(0.08, now + i * 0.03);
-        sGain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.03 + 0.13);
-        shard.connect(sGain);
-        sGain.connect(ctx.destination);
-        shard.start(now + i * 0.03);
-        shard.stop(now + i * 0.03 + 0.14);
-      });
     } else if (type === 'block') {
       [320, 640, 1280].forEach((freq, idx) => {
         const osc = ctx.createOscillator();
@@ -146,87 +97,40 @@ function playGameSound(type: SoundEventType) {
         osc.start(now);
         osc.stop(now + 0.4);
       });
-    } else if (type === 'revZeroTrigger') {
-      const sweep = ctx.createOscillator();
-      const sGain = ctx.createGain();
-      sweep.type = 'sawtooth';
-      sweep.frequency.setValueAtTime(220, now);
-      sweep.frequency.exponentialRampToValueAtTime(1320, now + 0.35);
-      sGain.gain.setValueAtTime(0.25, now);
-      sGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
-      sweep.connect(sGain);
-      sGain.connect(ctx.destination);
-      sweep.start(now);
-      sweep.stop(now + 0.44);
-
-      [880, 1174.66, 1760].forEach((freq, i) => {
-        const chime = ctx.createOscillator();
-        const cGain = ctx.createGain();
-        chime.type = 'triangle';
-        chime.frequency.setValueAtTime(freq, now + 0.25 + i * 0.04);
-        cGain.gain.setValueAtTime(0.22, now + 0.25 + i * 0.04);
-        cGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.75);
-        chime.connect(cGain);
-        cGain.connect(ctx.destination);
-        chime.start(now + 0.25 + i * 0.04);
-        chime.stop(now + 0.78);
-      });
-    } else if (type === 'directAttack') {
-      const expSize = Math.floor(ctx.sampleRate * 0.85);
-      const expBuffer = ctx.createBuffer(1, expSize, ctx.sampleRate);
-      const expData = expBuffer.getChannelData(0);
-      for (let i = 0; i < expSize; i++) {
-        expData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.25));
-      }
-      const expSource = ctx.createBufferSource();
-      expSource.buffer = expBuffer;
-
-      const lpFilter = ctx.createBiquadFilter();
-      lpFilter.type = 'lowpass';
-      lpFilter.frequency.setValueAtTime(900, now);
-      lpFilter.frequency.exponentialRampToValueAtTime(140, now + 0.8);
-
-      const expGain = ctx.createGain();
-      expGain.gain.setValueAtTime(0.5, now);
-      expGain.gain.exponentialRampToValueAtTime(0.001, now + 0.85);
-
-      expSource.connect(lpFilter);
-      lpFilter.connect(expGain);
-      expGain.connect(ctx.destination);
-      expSource.start(now);
-
-      const boom = ctx.createOscillator();
-      const boomGain = ctx.createGain();
-      boom.type = 'sawtooth';
-      boom.frequency.setValueAtTime(180, now);
-      boom.frequency.exponentialRampToValueAtTime(32, now + 0.75);
-      boomGain.gain.setValueAtTime(0.45, now);
-      boomGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.8);
-      boom.connect(boomGain);
-      boomGain.connect(ctx.destination);
-      boom.start(now);
-      boom.stop(now + 0.82);
-
-      const chord = [523.25, 659.25, 783.99, 1046.5];
-      chord.forEach((freq, idx) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'triangle';
-        const startAt = now + 0.16 + idx * 0.045;
-        osc.frequency.setValueAtTime(freq, startAt);
-
-        gain.gain.setValueAtTime(0.001, startAt);
-        gain.gain.exponentialRampToValueAtTime(0.22, startAt + 0.03);
-        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.85);
-
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(startAt);
-        osc.stop(startAt + 0.88);
-      });
+    } else {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(440, now);
+      osc.frequency.exponentialRampToValueAtTime(220, now + 0.25);
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.27);
     }
   } catch (e) {
-    console.warn('Sound playback skipped:', e);
+    console.warn('Synth sound skipped:', e);
+  }
+}
+
+// 効果音再生メイン関数（指定されたMP3があれば即再生、なければ合成音）
+function playGameSound(type: SoundEventType) {
+  try {
+    const filePath = SOUND_FILE_MAP[type];
+    if (filePath) {
+      const audio = new Audio(encodeURI(filePath));
+      audio.volume = 0.85;
+      audio.play().catch((err) => {
+        console.warn('MP3 playback fallback:', filePath, err);
+        playSynthFallback(type);
+      });
+      return;
+    }
+    playSynthFallback(type);
+  } catch (e) {
+    console.warn('Sound playback error:', e);
   }
 }
 
@@ -531,7 +435,6 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), newState);
   };
 
-  // ★ 自分のクリーチャーの「暗くする（行動不能・無視） / 戻す」切り替え
   const handleToggleMyIgnore = async (targetCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const nextIgnored = !targetCard.ignored;
@@ -542,7 +445,6 @@ function BattleRoomContent() {
     setSelectedCard(null);
   };
 
-  // ★ 相手のクリーチャーの「暗くする（行動不能・無視） / 戻す」切り替え
   const handleToggleOpponentIgnore = async (targetCard: BattleCardInstance) => {
     if (!opponent || !topPlayerId || isSpectator) return;
     const nextIgnored = !targetCard.ignored;
@@ -555,7 +457,7 @@ function BattleRoomContent() {
     setInspectCard(null);
   };
 
-  // 【禁断専用】封印を1枚外す／乗せる／禁断解放／表裏画像アップロード
+  // 【禁断専用】封印を1枚外す／乗せる／禁断解放（地響き.mp3再生！）／表裏画像アップロード
   const handleRemoveOneSeal = async (kindanCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const seals = kindanCard.underCards || [];
@@ -644,6 +546,7 @@ function BattleRoomContent() {
     setSelectedCard(null);
 
     if (nextAwakened) {
+      await broadcastSound('kindanRelease');
       await triggerCutIn(
         'evolution',
         me.name,
@@ -1001,6 +904,7 @@ function BattleRoomContent() {
     } else if (dest === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
       await updateMyState({ battleZone: [...cleanBZ, updatedCard] });
+      await broadcastSound('summon');
       await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
     } else if (dest === 'mana') {
       await updateMyState({ mana: [...mana, updatedCard] });
@@ -1049,7 +953,8 @@ function BattleRoomContent() {
   const moveCard = async (
     card: BattleCardInstance,
     fromZone: ZoneType,
-    toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom'
+    toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom',
+    skipSound = false
   ) => {
     if (!me || isSpectator) return;
 
@@ -1102,6 +1007,9 @@ function BattleRoomContent() {
     setSelectedCard(null);
 
     if (toZone === 'battleZone') {
+      if (!skipSound) {
+        await broadcastSound('summon');
+      }
       const originLabel =
         fromZone === 'mana'
           ? 'マナゾーンから登場！'
@@ -1129,6 +1037,7 @@ function BattleRoomContent() {
     setSelectedCard(null);
   };
 
+  // シンプルな攻撃宣言（大パンチ.mp3）
   const handleAttackDeclare = async (attacker: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const updatedBZ = battleZone.map((c) =>
@@ -1141,6 +1050,7 @@ function BattleRoomContent() {
     await triggerCutIn('attack', me.name, attacker, 'クリーチャーで攻撃宣言！');
   };
 
+  // ダイレクトアタック宣言（大パンチ.mp3 → 相手が敗北承認で 爆発2.mp3）
   const handleDeclareDirectAttack = async (attacker: BattleCardInstance) => {
     if (!me || isSpectator) return;
     if (!topPlayerId) return alert('対戦相手がまだいません');
@@ -1173,6 +1083,7 @@ function BattleRoomContent() {
     );
   };
 
+  // 相手が「敗北を認める」を押した時（爆発2.mp3）
   const handleAcceptDefeat = async () => {
     if (!pendingDirectAttack || !me) return;
     const { attackerPlayerName, card } = pendingDirectAttack;
@@ -1189,6 +1100,7 @@ function BattleRoomContent() {
     );
   };
 
+  // 革命0トリガー発動（キャラ出し＝シャキーン1.mp3 / 呪文詠唱＝魔法陣を展開.mp3）
   const handleActivateRevZeroTrigger = async (
     card: BattleCardInstance,
     dest: 'battleZone' | 'graveyard'
@@ -1220,7 +1132,7 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}`), {
       pendingDirectAttack: null,
     });
-    await broadcastSound('revZeroTrigger');
+    await broadcastSound(dest === 'battleZone' ? 'revZeroTrigger' : 'spell');
     await triggerCutIn(
       'trigger',
       me.name,
@@ -1251,6 +1163,7 @@ function BattleRoomContent() {
     );
   };
 
+  // シールドブレイク（ガラスが割れる1.mp3）
   const handleBreakShield = async (card: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const nextShields = shields.filter((c) => c.instanceId !== card.instanceId);
@@ -1287,6 +1200,7 @@ function BattleRoomContent() {
     });
   };
 
+  // 進化確定（シャキーン1.mp3）
   const handleConfirmFreeEvolution = async () => {
     if (!me || isSpectator || !evolutionBuilder || isEvolvingBusy) return;
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
@@ -1420,6 +1334,7 @@ function BattleRoomContent() {
         battleZone: nextBZ,
       });
 
+      await broadcastSound('summon');
       await triggerCutIn(
         'evolution',
         me.name,
@@ -1431,6 +1346,7 @@ function BattleRoomContent() {
     }
   };
 
+  // 革命チェンジ（シャキーン1.mp3）
   const handleExecuteRevolutionChange = async (targetCard: BattleCardInstance) => {
     if (!me || isSpectator || !revolutionChangePending) return;
     const { card: incomingCard, fromZone } = revolutionChangePending;
@@ -1481,6 +1397,7 @@ function BattleRoomContent() {
     setRevolutionChangePending(null);
     setSelectedCard(null);
 
+    await broadcastSound('summon');
     await triggerCutIn(
       'evolution',
       me.name,
@@ -1537,6 +1454,7 @@ function BattleRoomContent() {
     } else if (toZone === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
       await updateMyState({ deck: nextDeck, battleZone: [...cleanBZ, updatedCard] });
+      await broadcastSound('summon');
       await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
     } else if (toZone === 'mana') {
       await updateMyState({ deck: nextDeck, mana: [...mana, updatedCard] });
@@ -2014,7 +1932,7 @@ function BattleRoomContent() {
           )}
         </div>
 
-        {/* 相手バトルゾーン（通常クリーチャー左、禁断カード右端固定） */}
+        {/* 相手バトルゾーン */}
         <div className="flex items-center justify-between gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded">
           <div className="flex flex-wrap gap-2 items-center flex-1">
             <span className="text-[10px] text-slate-400 mr-1">
@@ -2054,7 +1972,7 @@ function BattleRoomContent() {
           </div>
         )}
 
-        {/* 自分バトルゾーン（通常クリーチャー左、禁断カード右端固定） */}
+        {/* 自分バトルゾーン */}
         <div className="flex items-center justify-between gap-2 min-h-[85px] bg-slate-800/60 p-2 rounded">
           <div className="flex flex-wrap gap-2 items-center flex-1">
             <span className="text-[10px] text-emerald-400 font-bold mr-1">バトルゾーン:</span>
@@ -2502,7 +2420,8 @@ function BattleRoomContent() {
                   onClick={async () => {
                     const c = brokenShieldCard;
                     setBrokenShieldCard(null);
-                    await moveCard(c, 'hand', 'graveyard');
+                    await moveCard(c, 'hand', 'graveyard', true);
+                    await broadcastSound('spell');
                     if (me) {
                       await triggerCutIn('trigger', me.name, c, 'S・トリガー呪文を詠唱！');
                     }
@@ -2596,7 +2515,6 @@ function BattleRoomContent() {
               </div>
             )}
 
-            {/* 相手のバトルゾーンのクリーチャーを「暗くする（行動不能・無視） / 戻す」 */}
             {!isSpectator &&
               inspectCard.isOpponentCard &&
               inspectCard.sourceZone === 'battleZone' && (
@@ -2943,7 +2861,8 @@ function BattleRoomContent() {
                   <button
                     onClick={async () => {
                       const c = selectedCard.card;
-                      await moveCard(c, 'hand', 'graveyard');
+                      await moveCard(c, 'hand', 'graveyard', true);
+                      await broadcastSound('spell');
                       if (me) {
                         await triggerCutIn('ability', me.name, c, '呪文を詠唱！');
                       }
