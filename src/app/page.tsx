@@ -1,11 +1,18 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { ref, set, get, onValue, remove } from 'firebase/database';
-import { db } from '@/lib/firebase';
+import { supabase } from '@/lib/supabase';
+import { fetchCustomDecks, deleteCustomDeck } from '@/lib/supabaseDecks';
+import { uploadCardImageToSupabase } from '@/lib/supabaseStorage';
 import { DeckPreset } from '@/data/decks';
 import { CardData, CardInstance, GameRoom, KindanType } from '@/types/game';
+
+type KindanImageKey =
+  | 'dokindamFront'
+  | 'dokindamBack'
+  | 'dormageddonFront'
+  | 'dormageddonBack';
 
 function createDeckInstances(cards: CardData[]): CardInstance[] {
   const instances: CardInstance[] = cards.map((card, index) => ({
@@ -20,31 +27,6 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
     [instances[i], instances[j]] = [instances[j], instances[i]];
   }
   return instances;
-}
-
-function compressImageToDataUrl(file: File, maxHeight = 960): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const scale = img.height > maxHeight ? maxHeight / img.height : 1;
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return reject(new Error('Canvas error'));
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL('image/jpeg', 0.92));
-      };
-      img.onerror = reject;
-      img.src = reader.result as string;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
 }
 
 function createKindanCard(
@@ -94,6 +76,32 @@ function createKindanCard(
   return null;
 }
 
+async function fetchRoomById(roomId: string): Promise<GameRoom | null> {
+  const { data, error } = await supabase
+    .from('rooms')
+    .select('state')
+    .eq('room_id', roomId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return (data?.state as GameRoom | undefined) ?? null;
+}
+
+async function upsertRoom(roomId: string, room: GameRoom): Promise<void> {
+  const { error } = await supabase
+    .from('rooms')
+    .upsert(
+      {
+        room_id: roomId,
+        state: room,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'room_id' }
+    );
+
+  if (error) throw error;
+}
+
 export default function HomePage() {
   const router = useRouter();
   const [playerName, setPlayerName] = useState('');
@@ -101,12 +109,7 @@ export default function HomePage() {
   const [selectedDeckId, setSelectedDeckId] = useState<string>('');
   const [selectedKindan, setSelectedKindan] = useState<KindanType>('none');
 
-  const [kindanImages, setKindanImages] = useState<{
-    dokindamFront: string;
-    dokindamBack: string;
-    dormageddonFront: string;
-    dormageddonBack: string;
-  }>({
+  const [kindanImages, setKindanImages] = useState<Record<KindanImageKey, string>>({
     dokindamFront: '',
     dokindamBack: '',
     dormageddonFront: '',
@@ -129,43 +132,74 @@ export default function HomePage() {
     setJoinRoomId('');
   };
 
+  const loadDecks = useCallback(async () => {
+    try {
+      const records = await fetchCustomDecks();
+      const list: DeckPreset[] = records.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description || '画像から作成したカスタム40枚デッキ',
+        cards: (r.cards || []) as CardData[],
+      }));
+      setCustomDecks(list);
+      setSelectedDeckId((prev) => {
+        if (prev && list.some((d) => d.id === prev)) return prev;
+        return list.length > 0 ? list[0].id : '';
+      });
+    } catch (err) {
+      console.error('デッキ一覧の取得に失敗:', err);
+    }
+  }, []);
+
+  const loadKindanImages = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from('shared_kindan_images')
+        .select('key, image_url');
+      if (error) throw error;
+      if (data && data.length > 0) {
+        setKindanImages((prev) => {
+          const next = { ...prev };
+          for (const row of data) {
+            const k = row.key as KindanImageKey;
+            if (k in next && row.image_url) {
+              next[k] = row.image_url;
+            }
+          }
+          return next;
+        });
+      }
+    } catch (err) {
+      console.error('共有禁断画像の取得に失敗:', err);
+    }
+  }, []);
+
   useEffect(() => {
     const savedName = localStorage.getItem('dm_player_name') || '';
     if (savedName) setPlayerName(savedName);
 
-    // 3時間以上前に作られた放置部屋をFirebaseから自動掃除
-    get(ref(db, 'rooms')).then((allSnap) => {
-      if (!allSnap.exists()) return;
-      const allRooms = allSnap.val() as Record<string, GameRoom>;
-      const now = Date.now();
-      Object.entries(allRooms).forEach(([rId, rVal]) => {
-        if (rVal?.createdAt && now - rVal.createdAt > 3 * 60 * 60 * 1000) {
-          remove(ref(db, `rooms/${rId}`));
-        }
-      });
-    });
-
     try {
       const savedKindanImgs = localStorage.getItem('dm_kindan_images');
       if (savedKindanImgs) {
-        setKindanImages(JSON.parse(savedKindanImgs));
+        setKindanImages((prev) => ({ ...prev, ...JSON.parse(savedKindanImgs) }));
       }
     } catch {
       // ignore
     }
 
-    const kindanImgRef = ref(db, 'sharedKindanImages');
-    const unsubKindanImg = onValue(kindanImgRef, (snap) => {
-      if (snap.exists()) {
-        const val = snap.val();
-        setKindanImages((prev) => ({
-          dokindamFront: val.dokindamFront || prev.dokindamFront || '',
-          dokindamBack: val.dokindamBack || prev.dokindamBack || '',
-          dormageddonFront: val.dormageddonFront || prev.dormageddonFront || '',
-          dormageddonBack: val.dormageddonBack || prev.dormageddonBack || '',
-        }));
-      }
-    });
+    // 3時間以上前に作られた放置部屋をSupabaseから自動掃除
+    const now = Date.now();
+    const threeHoursAgoIso = new Date(now - 3 * 60 * 60 * 1000).toISOString();
+    supabase
+      .from('rooms')
+      .delete()
+      .lt('updated_at', threeHoursAgoIso)
+      .then(({ error }) => {
+        if (error) console.error('放置部屋の掃除に失敗:', error);
+      });
+
+    loadDecks();
+    loadKindanImages();
 
     const savedRoomId = localStorage.getItem('dm_last_room_id');
     const savedPlayerId = localStorage.getItem('dm_player_id');
@@ -176,64 +210,71 @@ export default function HomePage() {
       localStorage.removeItem('dm_last_room_id');
       localStorage.removeItem('dm_last_room_ts');
     } else if (savedRoomId && savedPlayerId && !savedPlayerId.startsWith('spectator_')) {
-      get(ref(db, `rooms/${savedRoomId}`)).then((snap) => {
-        if (snap.exists()) {
-          const r = snap.val() as GameRoom;
-          const alreadyLeft = r.leftPlayers?.[savedPlayerId];
-          if (r.status !== 'finished' && !alreadyLeft && r.players && r.players[savedPlayerId]) {
-            setLastActiveRoom({
-              roomId: savedRoomId,
-              playerId: savedPlayerId,
-              playerName: r.players[savedPlayerId].name || savedName,
-            });
-            setJoinRoomId(savedRoomId);
-          } else {
-            localStorage.removeItem('dm_last_room_id');
-            localStorage.removeItem('dm_last_room_ts');
+      fetchRoomById(savedRoomId)
+        .then((r) => {
+          if (r) {
+            const alreadyLeft = r.leftPlayers?.[savedPlayerId];
+            if (r.status !== 'finished' && !alreadyLeft && r.players && r.players[savedPlayerId]) {
+              setLastActiveRoom({
+                roomId: savedRoomId,
+                playerId: savedPlayerId,
+                playerName: r.players[savedPlayerId].name || savedName,
+              });
+              setJoinRoomId(savedRoomId);
+              return;
+            }
           }
-        } else {
           localStorage.removeItem('dm_last_room_id');
           localStorage.removeItem('dm_last_room_ts');
-        }
-      });
+        })
+        .catch((err) => console.error(err));
     }
 
-    const decksRef = ref(db, 'customDecks');
-    const unsubscribe = onValue(decksRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list = Object.values(val) as DeckPreset[];
-        setCustomDecks(list);
-        setSelectedDeckId((prev) => {
-          if (prev && list.some((d) => d.id === prev)) return prev;
-          return list.length > 0 ? list[0].id : '';
-        });
-      } else {
-        setCustomDecks([]);
-        setSelectedDeckId('');
-      }
-    });
+    const channel = supabase
+      .channel('home-sync')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'custom_decks' },
+        () => {
+          loadDecks();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'shared_kindan_images' },
+        () => {
+          loadKindanImages();
+        }
+      )
+      .subscribe();
 
     return () => {
-      unsubscribe();
-      unsubKindanImg();
+      supabase.removeChannel(channel);
     };
-  }, []);
+  }, [loadDecks, loadKindanImages]);
 
-  const handleUploadKindanImage = async (
-    key: 'dokindamFront' | 'dokindamBack' | 'dormageddonFront' | 'dormageddonBack',
-    file?: File
-  ) => {
+  const handleUploadKindanImage = async (key: KindanImageKey, file?: File) => {
     if (!file) return;
     try {
-      const dataUrl = await compressImageToDataUrl(file);
-      const updated = { ...kindanImages, [key]: dataUrl };
+      const publicUrl = await uploadCardImageToSupabase(file, 'kindan', 960);
+      const updated = { ...kindanImages, [key]: publicUrl };
       setKindanImages(updated);
       localStorage.setItem('dm_kindan_images', JSON.stringify(updated));
-      await set(ref(db, `sharedKindanImages/${key}`), dataUrl);
+
+      const { error } = await supabase
+        .from('shared_kindan_images')
+        .upsert(
+          {
+            key,
+            image_url: publicUrl,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'key' }
+        );
+      if (error) throw error;
     } catch (error) {
       console.error(error);
-      alert('画像の読み込みに失敗しました');
+      alert('画像のアップロードに失敗しました');
     }
   };
 
@@ -243,7 +284,8 @@ export default function HomePage() {
       return;
     }
     try {
-      await remove(ref(db, `customDecks/${deck.id}`));
+      await deleteCustomDeck(deck.id);
+      await loadDecks();
     } catch (error) {
       console.error(error);
       alert('デッキの削除に失敗しました');
@@ -312,8 +354,8 @@ export default function HomePage() {
       let roomId = '';
       for (let attempt = 0; attempt < 15; attempt++) {
         const candidate = String(Math.floor(100 + Math.random() * 900));
-        const snap = await get(ref(db, `rooms/${candidate}`));
-        if (!snap.exists()) {
+        const existing = await fetchRoomById(candidate);
+        if (!existing) {
           roomId = candidate;
           break;
         }
@@ -346,7 +388,7 @@ export default function HomePage() {
         },
       };
 
-      await set(ref(db, `rooms/${roomId}`), newRoom);
+      await upsertRoom(roomId, newRoom);
       router.push(`/room/${roomId}`);
     } catch (error) {
       console.error(error);
@@ -363,16 +405,14 @@ export default function HomePage() {
 
     setLoading(true);
     try {
-      const roomRef = ref(db, `rooms/${cleanRoomId}`);
-      const snapshot = await get(roomRef);
+      const roomData = await fetchRoomById(cleanRoomId);
 
-      if (!snapshot.exists()) {
+      if (!roomData) {
         alert('そのルームIDの部屋は見つかりませんでした');
         setLoading(false);
         return;
       }
 
-      const roomData = snapshot.val() as GameRoom;
       const playersMap = roomData.players || {};
       const existingPlayerIds = Object.keys(playersMap);
       const trimmedName = playerName.trim();
@@ -426,8 +466,16 @@ export default function HomePage() {
         deckPreset,
         selectedKindan
       );
-      await set(ref(db, `rooms/${cleanRoomId}/players/${newPlayerId}`), joinPlayer);
 
+      const updatedRoom: GameRoom = {
+        ...roomData,
+        players: {
+          ...playersMap,
+          [newPlayerId]: joinPlayer,
+        },
+      };
+
+      await upsertRoom(cleanRoomId, updatedRoom);
       router.push(`/room/${cleanRoomId}`);
     } catch (error) {
       console.error(error);
@@ -443,10 +491,9 @@ export default function HomePage() {
 
     setLoading(true);
     try {
-      const roomRef = ref(db, `rooms/${cleanRoomId}`);
-      const snapshot = await get(roomRef);
+      const roomData = await fetchRoomById(cleanRoomId);
 
-      if (!snapshot.exists()) {
+      if (!roomData) {
         alert('そのルームIDの部屋は見つかりませんでした');
         setLoading(false);
         return;

@@ -1,11 +1,11 @@
 'use client';
 
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { ref, onValue, update, get, remove, set } from 'firebase/database';
-import { db } from '@/lib/firebase';
+import { supabase } from '@/lib/supabase';
+import { fetchCustomDeckById } from '@/lib/supabaseDecks';
+import { uploadCardImageToSupabase } from '@/lib/supabaseStorage';
 import { CardData, CardInstance, GameRoom, KindanType, PlayerState } from '@/types/game';
-import { DeckPreset } from '@/data/decks';
 import CutInOverlay, { CutInEvent } from '@/components/CutInOverlay';
 
 type ZoneType = 'hand' | 'mana' | 'battleZone' | 'shields' | 'graveyard';
@@ -39,6 +39,17 @@ interface PendingDirectAttack {
   card: BattleCardInstance;
   timestamp: number;
 }
+
+type ExtendedRoom = GameRoom & {
+  pendingDirectAttack?: PendingDirectAttack | null;
+  soundEvent?: { id: string; type: SoundEventType; timestamp: number } | null;
+  inspectingText?: string | null;
+  cutIn?: CutInEvent | null;
+  publicReveal?: {
+    playerName: string;
+    cards: BattleCardInstance[];
+  } | null;
+};
 
 // public/sounds/ 内のMP3ファイル名マッピング（半角英数字・日本語の両方に自動対応）
 const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
@@ -142,31 +153,6 @@ function playGameSound(type: SoundEventType) {
   }
 }
 
-function compressImageToDataUrl(file: File, maxHeight = 960): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const scale = img.height > maxHeight ? maxHeight / img.height : 1;
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return reject(new Error('Canvas error'));
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL('image/jpeg', 0.92));
-      };
-      img.onerror = reject;
-      img.src = reader.result as string;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
 function createDeckInstances(cards: CardData[]): BattleCardInstance[] {
   const instances: BattleCardInstance[] = cards.map((card, index) => ({
     ...card,
@@ -233,13 +219,44 @@ function createKindanCard(
   return null;
 }
 
+async function fetchRoomState(targetRoomId: string): Promise<ExtendedRoom | null> {
+  const { data, error } = await supabase
+    .from('rooms')
+    .select('state')
+    .eq('room_id', targetRoomId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return (data?.state as ExtendedRoom | undefined) ?? null;
+}
+
+async function saveRoomState(targetRoomId: string, nextState: ExtendedRoom): Promise<void> {
+  const { error } = await supabase
+    .from('rooms')
+    .upsert(
+      {
+        room_id: targetRoomId,
+        state: nextState,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'room_id' }
+    );
+
+  if (error) throw error;
+}
+
+async function deleteRoomRow(targetRoomId: string): Promise<void> {
+  const { error } = await supabase.from('rooms').delete().eq('room_id', targetRoomId);
+  if (error) throw error;
+}
+
 function BattleRoomContent() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
   const roomId = (params.roomId as string)?.trim();
 
-  const [room, setRoom] = useState<(GameRoom & { pendingDirectAttack?: PendingDirectAttack | null }) | null>(null);
+  const [room, setRoom] = useState<ExtendedRoom | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   const [spectatorShowHands, setSpectatorShowHands] = useState<boolean>(true);
   const [isEvolvingBusy, setIsEvolvingBusy] = useState<boolean>(false);
@@ -247,15 +264,21 @@ function BattleRoomContent() {
   const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
 
+  const roomRef = useRef<ExtendedRoom | null>(null);
   const prevTurnCountRef = useRef<number | null>(null);
   const prevTurnPlayerRef = useRef<string | null>(null);
   const prevSoundEventIdRef = useRef<string | null>(null);
   const prevPendingDirectIdRef = useRef<string | null>(null);
   const soundEnabledRef = useRef<boolean>(true);
+  const notFoundAlertedRef = useRef<boolean>(false);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
+
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
 
   const [selectedCard, setSelectedCard] = useState<{
     card: BattleCardInstance;
@@ -299,6 +322,19 @@ function BattleRoomContent() {
 
   const [resetting, setResetting] = useState(false);
 
+  const applyRoomUpdate = useCallback(
+    async (updater: (current: ExtendedRoom) => ExtendedRoom) => {
+      if (!roomId) return;
+      const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
+      if (!latest) return;
+      const next = updater(latest);
+      roomRef.current = next;
+      setRoom(next);
+      await saveRoomState(roomId, next);
+    },
+    [roomId]
+  );
+
   const broadcastSound = async (type: SoundEventType) => {
     if (!roomId) return;
     const id = `${type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -306,16 +342,18 @@ function BattleRoomContent() {
     if (soundEnabledRef.current) {
       playGameSound(type);
     }
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       soundEvent: { id, type, timestamp: Date.now() },
-    });
+    }));
   };
 
   const setInspectingStatus = async (text: string | null) => {
     if (!roomId) return;
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       inspectingText: text,
-    });
+    }));
   };
 
   const triggerCutIn = async (
@@ -338,9 +376,10 @@ function BattleRoomContent() {
       subText,
       timestamp: Date.now(),
     };
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       cutIn: event,
-    });
+    }));
   };
 
   useEffect(() => {
@@ -348,54 +387,90 @@ function BattleRoomContent() {
     setMyPlayerId(savedId);
 
     if (!roomId) return;
-    const roomRef = ref(db, `rooms/${roomId}`);
-    const unsubscribe = onValue(roomRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const raw = snapshot.val();
-        const data = raw as GameRoom & { pendingDirectAttack?: PendingDirectAttack | null };
 
-        if (
-          prevTurnCountRef.current !== null &&
-          prevTurnPlayerRef.current !== null &&
-          (data.turnCount > prevTurnCountRef.current ||
-            data.turnPlayerId !== prevTurnPlayerRef.current)
-        ) {
-          if (soundEnabledRef.current) {
-            playGameSound('turnEnd');
-          }
+    const handleIncomingRoom = (data: ExtendedRoom | null) => {
+      if (!data) {
+        if (!notFoundAlertedRef.current) {
+          notFoundAlertedRef.current = true;
+          alert('部屋が見つかりません');
+          router.push('/');
         }
-        prevTurnCountRef.current = data.turnCount;
-        prevTurnPlayerRef.current = data.turnPlayerId;
-
-        const se = raw.soundEvent as { id: string; type: SoundEventType; timestamp: number } | undefined;
-        if (se && se.id && se.id !== prevSoundEventIdRef.current) {
-          const isInitialLoad = prevSoundEventIdRef.current === null;
-          prevSoundEventIdRef.current = se.id;
-          if (!isInitialLoad || Date.now() - se.timestamp < 3000) {
-            if (soundEnabledRef.current) {
-              playGameSound(se.type);
-            }
-          }
-        } else if (!se && prevSoundEventIdRef.current === null) {
-          prevSoundEventIdRef.current = 'init';
-        }
-
-        const pda = data.pendingDirectAttack;
-        if (pda && pda.id !== prevPendingDirectIdRef.current) {
-          prevPendingDirectIdRef.current = pda.id;
-          setDefenseSubMode('main');
-        } else if (!pda) {
-          prevPendingDirectIdRef.current = null;
-        }
-
-        setRoom(data);
-      } else {
-        alert('部屋が見つかりません');
-        router.push('/');
+        return;
       }
-    });
 
-    return () => unsubscribe();
+      if (
+        prevTurnCountRef.current !== null &&
+        prevTurnPlayerRef.current !== null &&
+        (data.turnCount > prevTurnCountRef.current ||
+          data.turnPlayerId !== prevTurnPlayerRef.current)
+      ) {
+        if (soundEnabledRef.current) {
+          playGameSound('turnEnd');
+        }
+      }
+      prevTurnCountRef.current = data.turnCount;
+      prevTurnPlayerRef.current = data.turnPlayerId;
+
+      const se = data.soundEvent;
+      if (se && se.id && se.id !== prevSoundEventIdRef.current) {
+        const isInitialLoad = prevSoundEventIdRef.current === null;
+        prevSoundEventIdRef.current = se.id;
+        if (!isInitialLoad || Date.now() - se.timestamp < 3000) {
+          if (soundEnabledRef.current) {
+            playGameSound(se.type);
+          }
+        }
+      } else if (!se && prevSoundEventIdRef.current === null) {
+        prevSoundEventIdRef.current = 'init';
+      }
+
+      const pda = data.pendingDirectAttack;
+      if (pda && pda.id !== prevPendingDirectIdRef.current) {
+        prevPendingDirectIdRef.current = pda.id;
+        setDefenseSubMode('main');
+      } else if (!pda) {
+        prevPendingDirectIdRef.current = null;
+      }
+
+      roomRef.current = data;
+      setRoom(data);
+    };
+
+    fetchRoomState(roomId)
+      .then(handleIncomingRoom)
+      .catch((err) => {
+        console.error('ルーム読み込みエラー:', err);
+        if (!notFoundAlertedRef.current) {
+          notFoundAlertedRef.current = true;
+          alert('部屋が見つかりません');
+          router.push('/');
+        }
+      });
+
+    const channel = supabase
+      .channel(`room-${roomId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'rooms',
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            handleIncomingRoom(null);
+            return;
+          }
+          const nextState = (payload.new as { state?: ExtendedRoom } | undefined)?.state ?? null;
+          handleIncomingRoom(nextState);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [roomId, router]);
 
   if (!room) {
@@ -433,7 +508,7 @@ function BattleRoomContent() {
     pendingDirectAttack.attackerPlayerId === myPlayerId;
 
   const updateMyState = async (newState: Partial<PlayerState>, recordUndo = true) => {
-    if (!me || isSpectator) return;
+    if (!me || isSpectator || !myPlayerId) return;
 
     if (recordUndo) {
       const snapshot = JSON.stringify({
@@ -447,7 +522,20 @@ function BattleRoomContent() {
       setUndoStack((prev) => [...prev.slice(-19), snapshot]);
     }
 
-    await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), newState);
+    await applyRoomUpdate((cur) => {
+      const curPlayers = cur.players || {};
+      const curMe = curPlayers[myPlayerId] || me;
+      return {
+        ...cur,
+        players: {
+          ...curPlayers,
+          [myPlayerId]: {
+            ...curMe,
+            ...newState,
+          },
+        },
+      };
+    });
   };
 
   const handleToggleMyIgnore = async (targetCard: BattleCardInstance) => {
@@ -466,8 +554,19 @@ function BattleRoomContent() {
     const updatedOppBZ = ((opponent.battleZone || []) as BattleCardInstance[]).map((c) =>
       c.instanceId === targetCard.instanceId ? { ...c, ignored: nextIgnored } : c
     );
-    await update(ref(db, `rooms/${roomId}/players/${topPlayerId}`), {
-      battleZone: updatedOppBZ,
+    await applyRoomUpdate((cur) => {
+      const curPlayers = cur.players || {};
+      const curOpp = curPlayers[topPlayerId] || opponent;
+      return {
+        ...cur,
+        players: {
+          ...curPlayers,
+          [topPlayerId]: {
+            ...curOpp,
+            battleZone: updatedOppBZ,
+          },
+        },
+      };
     });
     setInspectCard(null);
   };
@@ -580,12 +679,12 @@ function BattleRoomContent() {
   ) => {
     if (!me || isSpectator || !file) return;
     try {
-      const dataUrl = await compressImageToDataUrl(file);
+      const publicUrl = await uploadCardImageToSupabase(file, 'kindan', 960);
       const updatedKindan: BattleCardInstance = {
         ...kindanCard,
         ...(side === 'front'
-          ? { imageUrl: dataUrl }
-          : { kindanAwakenedImageUrl: dataUrl, kindanAwakened: true }),
+          ? { imageUrl: publicUrl }
+          : { kindanAwakenedImageUrl: publicUrl, kindanAwakened: true }),
       };
       const nextBZ = (me.battleZone || []).map((c) =>
         c.instanceId === kindanCard.instanceId ? updatedKindan : c
@@ -594,8 +693,8 @@ function BattleRoomContent() {
       await updateMyState({
         battleZone: nextBZ,
         ...(side === 'front'
-          ? { kindanFrontImageUrl: dataUrl }
-          : { kindanBackImageUrl: dataUrl }),
+          ? { kindanFrontImageUrl: publicUrl }
+          : { kindanBackImageUrl: publicUrl }),
       });
 
       const sharedKey =
@@ -606,12 +705,19 @@ function BattleRoomContent() {
           : side === 'front'
           ? 'dormageddonFront'
           : 'dormageddonBack';
-      await set(ref(db, `sharedKindanImages/${sharedKey}`), dataUrl);
+      await supabase.from('shared_kindan_images').upsert(
+        {
+          key: sharedKey,
+          image_url: publicUrl,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'key' }
+      );
 
       setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
     } catch (e) {
       console.error(e);
-      alert('画像の読み込みに失敗しました');
+      alert('画像のアップロードに失敗しました');
     }
   };
 
@@ -654,11 +760,22 @@ function BattleRoomContent() {
     };
     nextOppShields.push(faceUpShieldCard);
 
-    await update(ref(db, `rooms/${roomId}/players/${topPlayerId}`), {
-      battleZone: nextOppBZ,
-      mana: nextOppMana,
-      graveyard: nextOppGrave,
-      shields: nextOppShields,
+    await applyRoomUpdate((cur) => {
+      const curPlayers = cur.players || {};
+      const curOpp = curPlayers[topPlayerId] || opponent;
+      return {
+        ...cur,
+        players: {
+          ...curPlayers,
+          [topPlayerId]: {
+            ...curOpp,
+            battleZone: nextOppBZ,
+            mana: nextOppMana,
+            graveyard: nextOppGrave,
+            shields: nextOppShields,
+          },
+        },
+      };
     });
 
     setInspectCard(null);
@@ -671,7 +788,7 @@ function BattleRoomContent() {
   };
 
   const handleUndo = async () => {
-    if (isSpectator || undoStack.length === 0 || !me) return;
+    if (isSpectator || undoStack.length === 0 || !me || !myPlayerId) return;
     const lastSnapshotStr = undoStack[undoStack.length - 1];
     const restored = JSON.parse(lastSnapshotStr);
     setUndoStack((prev) => prev.slice(0, -1));
@@ -679,12 +796,23 @@ function BattleRoomContent() {
     setSelectedCard(null);
     setBrokenShieldCard(null);
     setEvolutionBuilder(null);
-    await update(ref(db, `rooms/${roomId}`), {
-      inspectingText: null,
-      publicReveal: null,
-      pendingDirectAttack: null,
+    await applyRoomUpdate((cur) => {
+      const curPlayers = cur.players || {};
+      const curMe = curPlayers[myPlayerId] || me;
+      return {
+        ...cur,
+        inspectingText: null,
+        publicReveal: null,
+        pendingDirectAttack: null,
+        players: {
+          ...curPlayers,
+          [myPlayerId]: {
+            ...curMe,
+            ...restored,
+          },
+        },
+      };
     });
-    await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), restored);
   };
 
   const handleResetMatch = async () => {
@@ -700,18 +828,22 @@ function BattleRoomContent() {
     setResetting(true);
     try {
       const updatedPlayers: Record<string, PlayerState> = {};
-      const sharedSnap = await get(ref(db, 'sharedKindanImages'));
-      const sharedImgs = sharedSnap.exists() ? sharedSnap.val() : {};
+      const { data: sharedRows } = await supabase
+        .from('shared_kindan_images')
+        .select('key, image_url');
+      const sharedImgs: Record<string, string> = {};
+      (sharedRows || []).forEach((r) => {
+        if (r.key && r.image_url) sharedImgs[r.key] = r.image_url;
+      });
 
       for (const pid of playerIds) {
         const p = playersObj[pid];
         let baseCards: CardData[] = [];
 
         if (p.deckId) {
-          const deckSnap = await get(ref(db, `customDecks/${p.deckId}`));
-          if (deckSnap.exists()) {
-            const preset = deckSnap.val() as DeckPreset;
-            baseCards = preset.cards || [];
+          const deckRecord = await fetchCustomDeckById(p.deckId);
+          if (deckRecord) {
+            baseCards = (deckRecord.cards || []) as CardData[];
           }
         }
 
@@ -773,7 +905,8 @@ function BattleRoomContent() {
       }
 
       const firstPlayerId = playerIds[0] || myPlayerId;
-      await update(ref(db, `rooms/${roomId}`), {
+      await applyRoomUpdate((cur) => ({
+        ...cur,
         players: updatedPlayers,
         turnPlayerId: firstPlayerId,
         turnCount: 1,
@@ -781,7 +914,7 @@ function BattleRoomContent() {
         cutIn: null,
         publicReveal: null,
         pendingDirectAttack: null,
-      });
+      }));
 
       setUndoStack([]);
       setPeekState(null);
@@ -872,11 +1005,12 @@ function BattleRoomContent() {
   const handleTurnEnd = async () => {
     if (isSpectator) return;
     if (!topPlayerId) return alert('対戦相手がまだいません');
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       turnPlayerId: topPlayerId,
-      turnCount: (room.turnCount || 1) + 1,
+      turnCount: (cur.turnCount || 1) + 1,
       pendingDirectAttack: null,
-    });
+    }));
   };
 
   const handlePeekTopDeck = async (count: number, isPublic: boolean) => {
@@ -888,13 +1022,14 @@ function BattleRoomContent() {
     await updateMyState({ deck: newDeck });
 
     if (isPublic) {
-      await update(ref(db, `rooms/${roomId}`), {
+      await applyRoomUpdate((cur) => ({
+        ...cur,
         inspectingText: `${me.name} が山札の上から ${actualCount} 枚を公開中！`,
         publicReveal: {
           playerName: me.name,
           cards: revealed,
         },
-      });
+      }));
     } else {
       await setInspectingStatus(`${me.name} が山札の上から ${actualCount} 枚を非公開で確認中...`);
     }
@@ -931,19 +1066,21 @@ function BattleRoomContent() {
 
     if (remaining.length === 0) {
       setPeekState(null);
-      await update(ref(db, `rooms/${roomId}`), {
+      await applyRoomUpdate((cur) => ({
+        ...cur,
         inspectingText: null,
         publicReveal: null,
-      });
+      }));
     } else {
       setPeekState({ ...peekState, cards: remaining });
       if (peekState.isPublic) {
-        await update(ref(db, `rooms/${roomId}`), {
+        await applyRoomUpdate((cur) => ({
+          ...cur,
           publicReveal: {
             playerName: me.name,
             cards: remaining,
           },
-        });
+        }));
       }
     }
   };
@@ -961,10 +1098,11 @@ function BattleRoomContent() {
       await updateMyState({ graveyard: [...graveyard, ...toGrave] }, false);
     }
     setPeekState(null);
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       inspectingText: null,
       publicReveal: null,
-    });
+    }));
   };
 
   const moveCard = async (
@@ -979,7 +1117,7 @@ function BattleRoomContent() {
     const removeFrom = (list: BattleCardInstance[]) =>
       list.filter((c) => c.instanceId !== card.instanceId);
 
-    let nextDeck = [...deck];
+    const nextDeck = [...deck];
     let nextHand = [...hand];
     let nextMana = [...mana];
     let nextShields = [...shields];
@@ -1093,9 +1231,10 @@ function BattleRoomContent() {
     };
 
     await broadcastSound('attack');
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       pendingDirectAttack: pendingPayload,
-    });
+    }));
     await triggerCutIn(
       'attack',
       me.name,
@@ -1109,9 +1248,10 @@ function BattleRoomContent() {
     if (!pendingDirectAttack || !me) return;
     const { attackerPlayerName, card } = pendingDirectAttack;
 
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       pendingDirectAttack: null,
-    });
+    }));
     await broadcastSound('directAttack');
     await triggerCutIn(
       'attack',
@@ -1151,9 +1291,10 @@ function BattleRoomContent() {
       });
     }
 
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       pendingDirectAttack: null,
-    });
+    }));
     await broadcastSound(dest === 'battleZone' ? 'revZeroTrigger' : 'spell');
     await triggerCutIn(
       'trigger',
@@ -1173,9 +1314,10 @@ function BattleRoomContent() {
     );
     await updateMyState({ battleZone: updatedBZ });
 
-    await update(ref(db, `rooms/${roomId}`), {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
       pendingDirectAttack: null,
-    });
+    }));
     await broadcastSound('block');
     await triggerCutIn(
       'ability',
@@ -1832,17 +1974,21 @@ function BattleRoomContent() {
 
               if (!isSpectator && roomId && myPlayerId) {
                 try {
-                  await update(ref(db, `rooms/${roomId}/leftPlayers`), {
-                    [myPlayerId]: true,
-                  });
-                  const snap = await get(ref(db, `rooms/${roomId}`));
-                  if (snap.exists()) {
-                    const data = snap.val();
-                    const pIds = Object.keys(data.players || {});
-                    const leftMap = data.leftPlayers || {};
-                    const allLeft = pIds.length > 0 && pIds.every((id) => leftMap[id]);
+                  const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
+                  if (latest) {
+                    const pIds = Object.keys(latest.players || {});
+                    const nextLeftMap = {
+                      ...(latest.leftPlayers || {}),
+                      [myPlayerId]: true,
+                    };
+                    const allLeft = pIds.length > 0 && pIds.every((id) => nextLeftMap[id]);
                     if (allLeft) {
-                      await remove(ref(db, `rooms/${roomId}`));
+                      await deleteRoomRow(roomId);
+                    } else {
+                      await saveRoomState(roomId, {
+                        ...latest,
+                        leftPlayers: nextLeftMap,
+                      });
                     }
                   }
                 } catch (e) {
@@ -1868,9 +2014,10 @@ function BattleRoomContent() {
           <button
             type="button"
             onClick={async () => {
-              await update(ref(db, `rooms/${roomId}`), {
+              await applyRoomUpdate((cur) => ({
+                ...cur,
                 pendingDirectAttack: null,
-              });
+              }));
             }}
             className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] shrink-0 text-slate-200"
           >
@@ -2634,13 +2781,14 @@ function BattleRoomContent() {
                 <button
                   onClick={async () => {
                     setPeekState({ ...peekState, isPublic: true });
-                    await update(ref(db, `rooms/${roomId}`), {
+                    await applyRoomUpdate((cur) => ({
+                      ...cur,
                       inspectingText: `${me.name} が山札の上から ${peekState.cards.length} 枚を公開中！`,
                       publicReveal: {
                         playerName: me.name,
                         cards: peekState.cards,
                       },
-                    });
+                    }));
                   }}
                   className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded-lg text-xs font-extrabold"
                 >

@@ -2,10 +2,9 @@
 
 import { Suspense, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ref, push, set, get } from 'firebase/database';
-import { db } from '@/lib/firebase';
+import { fetchCustomDeckById, saveCustomDeck } from '@/lib/supabaseDecks';
+import { uploadCardImageToSupabase } from '@/lib/supabaseStorage';
 import { CardData } from '@/types/game';
-import { DeckPreset } from '@/data/decks';
 
 interface BuilderCardItem {
   tempId: string;
@@ -29,24 +28,24 @@ function DeckBuilderContent() {
 
   const [singleUrl, setSingleUrl] = useState('');
 
-  // 編集モードの場合、Firebaseから対象デッキを読み込んでカードごとに枚数を集計する
+  // 編集モードの場合、Supabaseから対象デッキを読み込んでカードごとに枚数を集計する
   useEffect(() => {
     if (!editId) return;
     setLoadingEdit(true);
 
-    get(ref(db, `customDecks/${editId}`))
-      .then((snapshot) => {
-        if (!snapshot.exists()) {
+    fetchCustomDeckById(editId)
+      .then((deck) => {
+        if (!deck) {
           alert('編集対象のデッキが見つかりませんでした');
           router.push('/');
           return;
         }
-        const deck = snapshot.val() as DeckPreset;
         setDeckName(deck.name || '');
         setDescription(deck.description || '');
 
         const grouped: BuilderCardItem[] = [];
-        (deck.cards || []).forEach((card) => {
+        const deckCards = (deck.cards || []) as CardData[];
+        deckCards.forEach((card) => {
           const existing = grouped.find(
             (g) => g.imageUrl === card.imageUrl && g.name === card.name
           );
@@ -73,35 +72,7 @@ function DeckBuilderContent() {
 
   const totalCards = items.reduce((sum, item) => sum + item.count, 0);
 
-  // 1枚の画像ファイルを圧縮してDataURLに変換するヘルパー（高画質・テキスト鮮明版）
-  const compressImageFile = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const img = new Image();
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          const maxHeight = 960;
-          const scale = img.height > maxHeight ? maxHeight / img.height : 1;
-          canvas.width = Math.round(img.width * scale);
-          canvas.height = Math.round(img.height * scale);
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            ctx.imageSmoothingEnabled = true;
-            ctx.imageSmoothingQuality = 'high';
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          }
-          resolve(canvas.toDataURL('image/jpeg', 0.92));
-        };
-        img.onerror = reject;
-        img.src = event.target?.result as string;
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  };
-
-  // 複数枚の画像を一括で読み込んでリストに追加する
+  // 複数枚の画像を一括で圧縮＆Supabase Storageへアップロードして公開URLを取得
   const handleMultipleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -113,7 +84,7 @@ function DeckBuilderContent() {
       let currentTotal = totalCards;
 
       for (const file of fileArray) {
-        const compressedUrl = await compressImageFile(file);
+        const publicUrl = await uploadCardImageToSupabase(file, 'deck-cards', 960);
         const remaining = 40 - currentTotal;
         const initialCount = remaining >= 4 ? 4 : remaining > 0 ? remaining : 1;
         currentTotal += initialCount;
@@ -122,8 +93,8 @@ function DeckBuilderContent() {
 
         newItems.push({
           tempId: Math.random().toString(36).substring(2, 9),
-          name: cleanName || `カード`,
-          imageUrl: compressedUrl,
+          name: cleanName || 'カード',
+          imageUrl: publicUrl,
           count: initialCount,
           isShieldTrigger: false,
         });
@@ -132,7 +103,7 @@ function DeckBuilderContent() {
       setItems((prev) => [...prev, ...newItems]);
     } catch (error) {
       console.error(error);
-      alert('一部の画像の読み込みに失敗しました');
+      alert('一部の画像のアップロードに失敗しました');
     } finally {
       setUploading(false);
       e.target.value = '';
@@ -181,7 +152,7 @@ function DeckBuilderContent() {
     );
   };
 
-  // Firebaseの共有デッキ一覧に保存（編集モードなら上書き保存）
+  // Supabaseの共有デッキ一覧に保存（編集モードなら上書き保存）
   const handleSaveDeck = async () => {
     if (!deckName.trim()) return alert('デッキ名を入力してください');
     if (totalCards !== 40) return alert(`現在 ${totalCards} 枚です。ちょうど40枚にしてください！`);
@@ -204,26 +175,21 @@ function DeckBuilderContent() {
         }
       });
 
-      if (editId) {
-        await set(ref(db, `customDecks/${editId}`), {
-          id: editId,
-          name: deckName.trim(),
-          description: description.trim() || '画像から作成したカスタム40枚デッキ',
-          cards,
-        });
-        alert('デッキの変更を上書き保存しました！');
-      } else {
-        const decksRef = ref(db, 'customDecks');
-        const newDeckRef = push(decksRef);
-        await set(newDeckRef, {
-          id: newDeckRef.key,
-          name: deckName.trim(),
-          description: description.trim() || '画像から作成したカスタム40枚デッキ',
-          cards,
-        });
-        alert('共有デッキとして保存しました！あなたも友達もトップ画面から使えます。');
-      }
+      const targetId =
+        editId || `deck-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
+      await saveCustomDeck({
+        id: targetId,
+        name: deckName.trim(),
+        description: description.trim() || '画像から作成したカスタム40枚デッキ',
+        cards,
+      });
+
+      alert(
+        editId
+          ? 'デッキの変更を上書き保存しました！'
+          : '共有デッキとして保存しました！あなたも友達もトップ画面から使えます。'
+      );
       router.push('/');
     } catch (error) {
       console.error(error);
@@ -292,7 +258,9 @@ function DeckBuilderContent() {
           </div>
 
           <label className="block w-full py-3 bg-sky-600 hover:bg-sky-500 text-center font-bold rounded-lg cursor-pointer transition text-sm">
-            {uploading ? '画像を読み込み・高画質処理中...' : '📁 フォルダ・写真から画像を一括選択する'}
+            {uploading
+              ? '画像を圧縮・Supabaseへアップロード中...'
+              : '📁 フォルダ・写真から画像を一括選択する'}
             <input
               type="file"
               accept="image/*"
@@ -433,7 +401,13 @@ function DeckBuilderContent() {
 
 export default function DeckBuilderPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen bg-slate-900 text-white flex items-center justify-center">読み込み中...</div>}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center">
+          読み込み中...
+        </div>
+      }
+    >
       <DeckBuilderContent />
     </Suspense>
   );
