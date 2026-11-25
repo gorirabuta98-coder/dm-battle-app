@@ -39,15 +39,15 @@ interface PendingDirectAttack {
   timestamp: number;
 }
 
-// public/sounds/ 内のMP3ファイル名マッピング
-const SOUND_FILE_MAP: Partial<Record<SoundEventType, string>> = {
-  shieldBreak: '/sounds/ガラスが割れる1.mp3',
-  summon: '/sounds/シャキーン1.mp3',
-  revZeroTrigger: '/sounds/シャキーン1.mp3',
-  directAttack: '/sounds/爆発2.mp3',
-  spell: '/sounds/魔法陣を展開.mp3',
-  kindanRelease: '/sounds/地響き.mp3',
-  attack: '/sounds/大パンチ.mp3',
+// public/sounds/ 内のMP3ファイル名マッピング（半角英数字・日本語の両方に自動対応）
+const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
+  shieldBreak: ['/sounds/shield.mp3', '/sounds/ガラスが割れる1.mp3', '/sounds/ガラスが割れる1.mp3.mp3'],
+  summon: ['/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
+  revZeroTrigger: ['/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
+  directAttack: ['/sounds/direct.mp3', '/sounds/爆発2.mp3', '/sounds/爆発2.mp3.mp3'],
+  spell: ['/sounds/spell.mp3', '/sounds/魔法陣を展開.mp3', '/sounds/魔法陣を展開.mp3.mp3'],
+  kindanRelease: ['/sounds/kindan.mp3', '/sounds/地響き.mp3', '/sounds/地響き.mp3.mp3'],
+  attack: ['/sounds/attack.mp3', '/sounds/大パンチ.mp3', '/sounds/大パンチ.mp3.mp3'],
 };
 
 // 合成音フォールバック＆ターンエンド・ブロック音
@@ -115,17 +115,24 @@ function playSynthFallback(type: SoundEventType) {
   }
 }
 
-// 効果音再生メイン関数（指定されたMP3があれば即再生、なければ合成音）
+// 効果音再生メイン関数（候補のMP3を順番に試して確実に再生）
 function playGameSound(type: SoundEventType) {
   try {
-    const filePath = SOUND_FILE_MAP[type];
-    if (filePath) {
-      const audio = new Audio(encodeURI(filePath));
-      audio.volume = 0.85;
-      audio.play().catch((err) => {
-        console.warn('MP3 playback fallback:', filePath, err);
-        playSynthFallback(type);
-      });
+    const candidates = SOUND_FILE_CANDIDATES[type];
+    if (candidates && candidates.length > 0) {
+      const tryPlay = (index: number) => {
+        if (index >= candidates.length) {
+          console.error(`音声ファイルが見つかりません (${type}):`, candidates);
+          return;
+        }
+        const rawPath = candidates[index];
+        const audio = new Audio(encodeURI(rawPath));
+        audio.volume = 0.85;
+        audio.play().catch(() => {
+          tryPlay(index + 1);
+        });
+      };
+      tryPlay(0);
       return;
     }
     playSynthFallback(type);
