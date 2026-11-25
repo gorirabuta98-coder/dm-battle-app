@@ -127,9 +127,19 @@ function playSynthFallback(type: SoundEventType) {
   }
 }
 
-// 効果音再生メイン関数（候補のMP3を順番に試して確実に再生）
+let lastGlobalSoundType: SoundEventType | null = null;
+let lastGlobalSoundTime = 0;
+
+// 効果音再生メイン関数（候補のMP3を順番に試して確実に再生・短時間の重複鳴りを防止）
 function playGameSound(type: SoundEventType) {
   try {
+    const nowMs = Date.now();
+    if (lastGlobalSoundType === type && nowMs - lastGlobalSoundTime < 120) {
+      return;
+    }
+    lastGlobalSoundType = type;
+    lastGlobalSoundTime = nowMs;
+
     const candidates = SOUND_FILE_CANDIDATES[type];
     if (candidates && candidates.length > 0) {
       const tryPlay = (index: number) => {
@@ -328,6 +338,9 @@ function BattleRoomContent() {
       const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
       if (!latest) return;
       const next = updater(latest);
+      if (next.soundEvent?.id) {
+        prevSoundEventIdRef.current = next.soundEvent.id;
+      }
       roomRef.current = next;
       setRoom(next);
       await saveRoomState(roomId, next);
@@ -1124,11 +1137,42 @@ function BattleRoomContent() {
     let nextBZ = [...battleZone];
     let nextGrave = [...graveyard];
 
-    if (fromZone === 'hand') nextHand = removeFrom(nextHand);
-    if (fromZone === 'mana') nextMana = removeFrom(nextMana);
-    if (fromZone === 'battleZone') nextBZ = removeFrom(nextBZ);
-    if (fromZone === 'shields') nextShields = removeFrom(nextShields);
-    if (fromZone === 'graveyard') nextGrave = removeFrom(nextGrave);
+    // バトルゾーンから墓地へ送る際、進化元（underCards）があれば一番上の進化元を場に残し、進化カードのみを墓地へ送る
+    const isTopEvolutionToGraveyard =
+      fromZone === 'battleZone' &&
+      toZone === 'graveyard' &&
+      !card.kindanRole &&
+      !!card.underCards &&
+      card.underCards.length > 0;
+
+    if (isTopEvolutionToGraveyard) {
+      const underList = card.underCards!;
+      const topUnder = underList[underList.length - 1];
+      const remainingUnder = underList.slice(0, -1).map((u) => ({
+        ...u,
+        tapped: false,
+        faceUp: true,
+        underCards: [],
+        ignored: false,
+      }));
+      const promotedUnderCard: BattleCardInstance = {
+        ...topUnder,
+        tapped: card.tapped,
+        faceUp: true,
+        underCards: remainingUnder,
+        ignored: false,
+        shieldOverlaySlot: undefined,
+      };
+      nextBZ = nextBZ.map((c) =>
+        c.instanceId === card.instanceId ? promotedUnderCard : c
+      );
+    } else {
+      if (fromZone === 'hand') nextHand = removeFrom(nextHand);
+      if (fromZone === 'mana') nextMana = removeFrom(nextMana);
+      if (fromZone === 'battleZone') nextBZ = removeFrom(nextBZ);
+      if (fromZone === 'shields') nextShields = removeFrom(nextShields);
+      if (fromZone === 'graveyard') nextGrave = removeFrom(nextGrave);
+    }
 
     const isFaceUpDest =
       toZone !== 'shields' && toZone !== 'deckTop' && toZone !== 'deckBottom';
@@ -1137,7 +1181,12 @@ function BattleRoomContent() {
       ...card,
       tapped: false,
       faceUp: isFaceUpDest,
-      underCards: toZone === 'battleZone' ? card.underCards || [] : [],
+      underCards:
+        isTopEvolutionToGraveyard
+          ? []
+          : toZone === 'battleZone'
+          ? card.underCards || []
+          : [],
       ignored: false,
       shieldOverlaySlot: toZone === 'shieldsFaceUp' ? shieldOverlaySlot : undefined,
     };
