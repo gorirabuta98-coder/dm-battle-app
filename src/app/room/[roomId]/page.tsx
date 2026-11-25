@@ -144,7 +144,7 @@ let lastGlobalSoundTime = 0;
 function playGameSound(type: SoundEventType) {
   try {
     const nowMs = Date.now();
-    if (lastGlobalSoundType === type && nowMs - lastGlobalSoundTime < 250) {
+    if (lastGlobalSoundType === type && nowMs - lastGlobalSoundTime < 450) {
       return;
     }
     lastGlobalSoundType = type;
@@ -306,6 +306,8 @@ function BattleRoomContent() {
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
 
   const roomRef = useRef<ExtendedRoom | null>(null);
+  const isUpdatingRef = useRef<boolean>(false);
+  const lastUpdateAtRef = useRef<number>(0);
   const prevTurnCountRef = useRef<number | null>(null);
   const prevTurnPlayerRef = useRef<string | null>(null);
   const prevSoundEventIdRef = useRef<string | null>(null);
@@ -364,57 +366,66 @@ function BattleRoomContent() {
 
   const [resetting, setResetting] = useState(false);
 
-  // 1回の操作につき1回だけDB保存し、効果音とカットインも同一更新内で発火させる
+  // 1回の操作につき1回だけDB保存し、二重送信・連打をロックで防ぐ
   const applyRoomUpdate = useCallback(
     async (updater: (current: ExtendedRoom) => ExtendedRoom, meta?: RoomUpdateMeta) => {
       if (!roomId) return;
-      const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
-      if (!latest) return;
-
       const now = Date.now();
-      const baseNext = updater(latest);
-      const soundEvent = meta?.sound
-        ? {
-            id: `se-${meta.sound}-${now}-${Math.random().toString(36).substring(2, 6)}`,
-            type: meta.sound,
-            timestamp: now,
-          }
-        : baseNext.soundEvent;
+      if (isUpdatingRef.current || now - lastUpdateAtRef.current < 400) {
+        return;
+      }
 
-      const cutIn = meta?.cutIn
-        ? {
-            ...buildCutInEvent(
-              meta.cutIn.type,
-              meta.cutIn.playerName,
-              meta.cutIn.card,
-              meta.cutIn.subText
-            ),
-            timestamp: now,
-          }
-        : baseNext.cutIn;
+      isUpdatingRef.current = true;
+      lastUpdateAtRef.current = now;
 
-      const next: ExtendedRoom = {
-        ...baseNext,
-        soundEvent,
-        cutIn,
-      };
+      try {
+        const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
+        if (!latest) return;
 
-      if (meta?.sound && soundEnabledRef.current) {
+        const baseNext = updater(latest);
+        const soundEvent = meta?.sound
+          ? {
+              id: `se-${meta.sound}-${now}-${Math.random().toString(36).substring(2, 6)}`,
+              type: meta.sound,
+              timestamp: now,
+            }
+          : baseNext.soundEvent;
+
+        const cutIn = meta?.cutIn
+          ? {
+              ...buildCutInEvent(
+                meta.cutIn.type,
+                meta.cutIn.playerName,
+                meta.cutIn.card,
+                meta.cutIn.subText
+              ),
+              timestamp: now,
+            }
+          : baseNext.cutIn;
+
+        const next: ExtendedRoom = {
+          ...baseNext,
+          soundEvent,
+          cutIn,
+        };
+
         if (soundEvent?.id) {
           prevSoundEventIdRef.current = soundEvent.id;
         }
-        playGameSound(meta.sound);
-      } else if (next.soundEvent?.id) {
-        prevSoundEventIdRef.current = next.soundEvent.id;
-      }
+        if (cutIn?.id) {
+          prevCutInIdRef.current = cutIn.id;
+        }
 
-      if (cutIn?.id) {
-        prevCutInIdRef.current = cutIn.id;
-      }
+        if (meta?.sound && soundEnabledRef.current) {
+          playGameSound(meta.sound);
+        }
 
-      roomRef.current = next;
-      setRoom(next);
-      await saveRoomState(roomId, next);
+        roomRef.current = next;
+        setRoom(next);
+        await saveRoomState(roomId, next);
+      } finally {
+        isUpdatingRef.current = false;
+      }
     },
     [roomId]
   );
