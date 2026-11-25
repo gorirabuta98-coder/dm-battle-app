@@ -23,6 +23,7 @@ type SoundEventType =
 
 type BattleCardInstance = CardInstance & {
   ignored?: boolean;
+  shieldOverlaySlot?: string;
 };
 
 interface SelectedEvolutionMaterial {
@@ -141,20 +142,22 @@ function playGameSound(type: SoundEventType) {
   }
 }
 
-function compressImageToDataUrl(file: File, maxWidth = 420): Promise<string> {
+function compressImageToDataUrl(file: File, maxHeight = 960): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const scale = Math.min(1, maxWidth / img.width);
+        const scale = img.height > maxHeight ? maxHeight / img.height : 1;
         const canvas = document.createElement('canvas');
         canvas.width = Math.round(img.width * scale);
         canvas.height = Math.round(img.height * scale);
         const ctx = canvas.getContext('2d');
         if (!ctx) return reject(new Error('Canvas error'));
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL('image/jpeg', 0.82));
+        resolve(canvas.toDataURL('image/jpeg', 0.92));
       };
       img.onerror = reject;
       img.src = reader.result as string;
@@ -172,6 +175,7 @@ function createDeckInstances(cards: CardData[]): BattleCardInstance[] {
     faceUp: false,
     underCards: [],
     ignored: false,
+    shieldOverlaySlot: undefined,
   }));
   for (let i = instances.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -256,6 +260,7 @@ function BattleRoomContent() {
   const [selectedCard, setSelectedCard] = useState<{
     card: BattleCardInstance;
     zone: ZoneType;
+    shieldSlotIndex?: number;
   } | null>(null);
 
   const [inspectCard, setInspectCard] = useState<{
@@ -265,7 +270,10 @@ function BattleRoomContent() {
     isOpponentCard?: boolean;
   } | null>(null);
 
-  const [brokenShieldCard, setBrokenShieldCard] = useState<BattleCardInstance | null>(null);
+  const [brokenShieldCard, setBrokenShieldCard] = useState<{
+    card: BattleCardInstance;
+    slotLabel?: string;
+  } | null>(null);
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [deckSearchOpen, setDeckSearchOpen] = useState(false);
   const [graveSearchOpen, setGraveSearchOpen] = useState(false);
@@ -817,6 +825,7 @@ function BattleRoomContent() {
       tapped: false,
       faceUp: dest !== 'shields',
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
 
     if (dest === 'hand') {
@@ -904,6 +913,7 @@ function BattleRoomContent() {
       faceUp: true,
       tapped: false,
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
 
     if (dest === 'hand') {
@@ -961,7 +971,8 @@ function BattleRoomContent() {
     card: BattleCardInstance,
     fromZone: ZoneType,
     toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom',
-    skipSound = false
+    skipSound = false,
+    shieldOverlaySlot?: string
   ) => {
     if (!me || isSpectator) return;
 
@@ -990,6 +1001,7 @@ function BattleRoomContent() {
       faceUp: isFaceUpDest,
       underCards: toZone === 'battleZone' ? card.underCards || [] : [],
       ignored: false,
+      shieldOverlaySlot: toZone === 'shieldsFaceUp' ? shieldOverlaySlot : undefined,
     };
 
     if (toZone === 'hand') nextHand.push(cleanCard);
@@ -1029,7 +1041,9 @@ function BattleRoomContent() {
         'ability',
         me.name,
         cleanCard,
-        '新しいシールドとして表向きで配置！'
+        shieldOverlaySlot
+          ? `${shieldOverlaySlot} に表向きシールドとして配置！`
+          : '新しいシールドとして表向きで配置！'
       );
     }
   };
@@ -1121,6 +1135,7 @@ function BattleRoomContent() {
       faceUp: true,
       underCards: [],
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
 
     if (dest === 'battleZone') {
@@ -1171,8 +1186,10 @@ function BattleRoomContent() {
   };
 
   // シールドブレイク（ガラスが割れる1.mp3）
-  const handleBreakShield = async (card: BattleCardInstance) => {
+  const handleBreakShield = async (card: BattleCardInstance, slotIndex?: number) => {
     if (!me || isSpectator) return;
+    const slotLabel =
+      card.shieldOverlaySlot || (slotIndex !== undefined ? `S${slotIndex + 1}` : undefined);
     const nextShields = shields.filter((c) => c.instanceId !== card.instanceId);
     const addedToHand: BattleCardInstance = {
       ...card,
@@ -1180,6 +1197,7 @@ function BattleRoomContent() {
       tapped: false,
       underCards: [],
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
     const nextHand = [...hand, addedToHand];
 
@@ -1189,7 +1207,7 @@ function BattleRoomContent() {
     });
 
     await broadcastSound('shieldBreak');
-    setBrokenShieldCard(addedToHand);
+    setBrokenShieldCard({ card: addedToHand, slotLabel });
   };
 
   const toggleEvolutionMaterial = (card: BattleCardInstance, sourceZone: EvolutionSourceZone) => {
@@ -1311,6 +1329,7 @@ function BattleRoomContent() {
         faceUp: true,
         underCards: collectedUnderCards,
         ignored: false,
+        shieldOverlaySlot: undefined,
       };
 
       if (firstBZAnchorId) {
@@ -1388,6 +1407,7 @@ function BattleRoomContent() {
       faceUp: true,
       underCards: [],
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
 
     const nextBZ = battleZone
@@ -1454,6 +1474,7 @@ function BattleRoomContent() {
       tapped: false,
       faceUp: toZone !== 'shields',
       ignored: false,
+      shieldOverlaySlot: undefined,
     };
 
     if (toZone === 'hand') {
@@ -1494,6 +1515,10 @@ function BattleRoomContent() {
         : card.imageUrl
       : card.imageUrl;
 
+    const slotName = `S${(index ?? 0) + 1}`;
+    const shieldBadgeLabel =
+      card.shieldOverlaySlot || (zone === 'shields' && index !== undefined ? slotName : '🛡️表盾');
+
     return (
       <div
         key={card.instanceId}
@@ -1511,11 +1536,11 @@ function BattleRoomContent() {
           }
 
           if (zone === 'shields' && !card.faceUp) {
-            handleBreakShield(card);
+            handleBreakShield(card, index);
             return;
           }
           if (zone === 'shields' && card.faceUp) {
-            setSelectedCard({ card, zone: 'shields' });
+            setSelectedCard({ card, zone: 'shields', shieldSlotIndex: index });
             return;
           }
           if (zone === 'mana') {
@@ -1537,9 +1562,15 @@ function BattleRoomContent() {
             }
             return;
           }
-          setSelectedCard({ card, zone });
+          setSelectedCard({ card, zone, shieldSlotIndex: zone === 'shields' ? index : undefined });
         }}
-        title={showFace ? `${card.name}（タップで操作・拡大）` : '裏向きカード'}
+        title={
+          zone === 'shields' && !card.faceUp
+            ? `${slotName}（タップでブレイク）`
+            : showFace
+            ? `${card.name}（タップで操作・拡大）`
+            : '裏向きカード'
+        }
         className={`relative select-none transition-all shrink-0 ${
           canClick ? 'cursor-pointer active:scale-95' : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
@@ -1627,7 +1658,7 @@ function BattleRoomContent() {
                 />
                 {zone === 'shields' && (
                   <span className="absolute top-0.5 left-0.5 bg-amber-400 text-slate-950 text-[8px] font-extrabold px-1 rounded shadow">
-                    🛡️表盾
+                    {shieldBadgeLabel}
                   </span>
                 )}
                 {card.isShieldTrigger && (
@@ -1648,6 +1679,11 @@ function BattleRoomContent() {
               </>
             ) : (
               <div className="p-1 flex flex-col justify-center items-center h-full">
+                {zone === 'shields' && (
+                  <span className="mb-0.5 bg-amber-400 text-slate-950 text-[8px] font-extrabold px-1 rounded">
+                    {shieldBadgeLabel}
+                  </span>
+                )}
                 <div className="text-[9px] font-bold leading-tight line-clamp-3 text-center">
                   {card.name}
                 </div>
@@ -1660,7 +1696,7 @@ function BattleRoomContent() {
             )
           ) : (
             <span className="text-xs font-bold">
-              {zone === 'shields' ? `S${(index ?? 0) + 1}` : 'DM'}
+              {zone === 'shields' ? slotName : 'DM'}
             </span>
           )}
         </div>
@@ -1692,6 +1728,11 @@ function BattleRoomContent() {
     }
     return deck.filter((c) => c.instanceId !== excludeId);
   };
+
+  const shieldSlotChoices = Array.from(
+    { length: Math.max(shields.length, 5) },
+    (_, i) => `S${i + 1}`
+  );
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-2 sm:p-4 max-w-6xl mx-auto">
@@ -1997,7 +2038,7 @@ function BattleRoomContent() {
         <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950/60 p-2 rounded">
           <div className="flex flex-wrap gap-1.5 items-center">
             <span className="text-[10px] text-amber-400 font-bold mr-1">
-              シールド ({shields.length}枚){!isSpectator && '(裏タップでブレイク／表タップで拡大)'}:
+              シールド ({shields.length}枚){!isSpectator && '(S1〜S5タップでブレイク／表盾タップで拡大)'}:
             </span>
             {shields.map((c, idx) =>
               renderCard(c, 'shields', !isSpectator, me?.name || '自分', idx)
@@ -2382,37 +2423,37 @@ function BattleRoomContent() {
           >
             <div className="w-full flex items-center justify-between">
               <span className="px-2.5 py-0.5 rounded bg-yellow-400 text-slate-950 text-xs font-extrabold">
-                🛡️ シールドブレイク（あなただけに見えています）
+                🛡️ {brokenShieldCard.slotLabel ? `${brokenShieldCard.slotLabel} ` : ''}ブレイク（あなただけに見えています）
               </span>
-              {brokenShieldCard.isShieldTrigger && (
+              {brokenShieldCard.card.isShieldTrigger && (
                 <span className="px-2 py-0.5 rounded bg-rose-600 text-white text-xs font-extrabold">
                   ⚡ S・トリガー持ち！
                 </span>
               )}
             </div>
 
-            {brokenShieldCard.imageUrl ? (
+            {brokenShieldCard.card.imageUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
-                src={brokenShieldCard.imageUrl}
-                alt={brokenShieldCard.name}
+                src={brokenShieldCard.card.imageUrl}
+                alt={brokenShieldCard.card.name}
                 className="w-[80vw] max-w-[360px] h-[56vh] max-h-[480px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl"
               />
             ) : (
               <div className="w-64 h-80 bg-slate-800 rounded-xl flex items-center justify-center font-bold text-lg p-4 text-center">
-                {brokenShieldCard.name}
+                {brokenShieldCard.card.name}
               </div>
             )}
 
             <div className="text-center font-bold text-base text-amber-300 truncate w-full">
-              {brokenShieldCard.name}
+              {brokenShieldCard.card.name}
             </div>
 
             <div className="w-full space-y-2">
               <div className="grid grid-cols-2 gap-2 text-xs font-bold">
                 <button
                   onClick={async () => {
-                    const c = brokenShieldCard;
+                    const c = brokenShieldCard.card;
                     setBrokenShieldCard(null);
                     await moveCard(c, 'hand', 'battleZone');
                     if (me) {
@@ -2425,7 +2466,7 @@ function BattleRoomContent() {
                 </button>
                 <button
                   onClick={async () => {
-                    const c = brokenShieldCard;
+                    const c = brokenShieldCard.card;
                     setBrokenShieldCard(null);
                     await moveCard(c, 'hand', 'graveyard', true);
                     await broadcastSound('spell');
@@ -2716,6 +2757,11 @@ function BattleRoomContent() {
 
             <div className="text-center space-y-1">
               <h3 className="font-bold text-base text-amber-400">{selectedCard.card.name}</h3>
+              {selectedCard.zone === 'shields' && selectedCard.shieldSlotIndex !== undefined && (
+                <div className="inline-block px-2.5 py-0.5 rounded bg-amber-500/20 border border-amber-400 text-[11px] font-extrabold text-amber-300">
+                  対象：{selectedCard.card.shieldOverlaySlot || `S${selectedCard.shieldSlotIndex + 1}`}
+                </div>
+              )}
               {selectedCard.card.kindanRole && (
                 <div className="inline-block px-3 py-1 rounded-full bg-rose-950 border border-rose-500 text-xs font-extrabold text-amber-300">
                   現在の封印：{selectedCard.card.underCards?.length || 0} 枚
@@ -2816,8 +2862,9 @@ function BattleRoomContent() {
                 <button
                   onClick={() => {
                     const c = selectedCard.card;
+                    const idx = selectedCard.shieldSlotIndex;
                     setSelectedCard(null);
-                    handleBreakShield(c);
+                    handleBreakShield(c, idx);
                   }}
                   className="py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded col-span-2 text-sm font-extrabold"
                 >
@@ -3018,7 +3065,7 @@ function BattleRoomContent() {
               )}
 
             {!selectedCard.card.kindanRole && (
-              <div className="pt-2 border-t border-slate-700 space-y-1.5">
+              <div className="pt-2 border-t border-slate-700 space-y-2">
                 <div className="text-[10px] text-slate-400 text-center">
                   このカードを別の場所へ送る
                 </div>
@@ -3058,22 +3105,12 @@ function BattleRoomContent() {
                     </button>
                   )}
                   {selectedCard.zone !== 'shields' && (
-                    <>
-                      <button
-                        onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'shields')}
-                        className="py-2 bg-amber-800 hover:bg-amber-700 rounded"
-                      >
-                        シールドへ(裏)
-                      </button>
-                      <button
-                        onClick={() =>
-                          moveCard(selectedCard.card, selectedCard.zone, 'shieldsFaceUp')
-                        }
-                        className="py-2 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded"
-                      >
-                        🛡️ 表向きシールドへ
-                      </button>
-                    </>
+                    <button
+                      onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'shields')}
+                      className="py-2 bg-amber-800 hover:bg-amber-700 rounded"
+                    >
+                      シールドへ(裏)
+                    </button>
                   )}
                   <button
                     onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'deckTop')}
@@ -3087,6 +3124,33 @@ function BattleRoomContent() {
                   >
                     山札の下へ
                   </button>
+                </div>
+
+                {/* シールドに表向きで乗せる（S1〜S5表記付き） */}
+                <div className="bg-amber-950/50 border border-amber-500/40 rounded-lg p-2 space-y-1.5">
+                  <div className="text-[10px] font-bold text-amber-300 text-center">
+                    🛡️ 表向きシールドとして乗せる（どの盾の上かS1〜S5表記）
+                  </div>
+                  <div className="grid grid-cols-5 gap-1 text-[11px] font-extrabold">
+                    {shieldSlotChoices.map((slot) => (
+                      <button
+                        key={slot}
+                        type="button"
+                        onClick={() =>
+                          moveCard(
+                            selectedCard.card,
+                            selectedCard.zone,
+                            'shieldsFaceUp',
+                            false,
+                            slot
+                          )
+                        }
+                        className="py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded transition"
+                      >
+                        {slot}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}
