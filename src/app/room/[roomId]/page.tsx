@@ -10,14 +10,34 @@ import CutInOverlay, { CutInEvent } from '@/components/CutInOverlay';
 
 type ZoneType = 'hand' | 'mana' | 'battleZone' | 'shields' | 'graveyard';
 type EvolutionSourceZone = 'battleZone' | 'mana' | 'graveyard' | 'hand' | 'deck';
+type SoundEventType =
+  | 'turnEnd'
+  | 'attack'
+  | 'shieldBreak'
+  | 'directAttack'
+  | 'block'
+  | 'revZeroTrigger';
+
+type BattleCardInstance = CardInstance & {
+  ignored?: boolean;
+};
 
 interface SelectedEvolutionMaterial {
-  card: CardInstance;
+  card: BattleCardInstance;
   sourceZone: EvolutionSourceZone;
 }
 
-// ターンエンド＆ターン交代時の効果音（Web Audio APIで2音チャイムを鳴らす）
-function playTurnEndSound() {
+interface PendingDirectAttack {
+  id: string;
+  attackerPlayerId: string;
+  attackerPlayerName: string;
+  defenderPlayerId: string;
+  card: BattleCardInstance;
+  timestamp: number;
+}
+
+// 各種効果音（Web Audio APIで外部ファイル不要・即再生）
+function playGameSound(type: SoundEventType) {
   try {
     const AudioCtx =
       window.AudioContext ||
@@ -28,26 +48,183 @@ function playTurnEndSound() {
     if (ctx.state === 'suspended') {
       ctx.resume();
     }
-
     const now = ctx.currentTime;
-    const notes = [587.33, 880.0]; // D5 -> A5 の爽やかなターン交代チャイム
 
-    notes.forEach((freq, idx) => {
+    if (type === 'turnEnd') {
+      const notes = [587.33, 880.0];
+      notes.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.11);
+
+        gain.gain.setValueAtTime(0.001, now + idx * 0.11);
+        gain.gain.exponentialRampToValueAtTime(0.22, now + idx * 0.11 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.11 + 0.38);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + idx * 0.11);
+        osc.stop(now + idx * 0.11 + 0.4);
+      });
+    } else if (type === 'attack') {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(freq, now + idx * 0.11);
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(760, now);
+      osc.frequency.exponentialRampToValueAtTime(110, now + 0.22);
 
-      gain.gain.setValueAtTime(0.001, now + idx * 0.11);
-      gain.gain.exponentialRampToValueAtTime(0.22, now + idx * 0.11 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.11 + 0.38);
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.28, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
 
       osc.connect(gain);
       gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.26);
 
-      osc.start(now + idx * 0.11);
-      osc.stop(now + idx * 0.11 + 0.4);
-    });
+      const sub = ctx.createOscillator();
+      const subGain = ctx.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(160, now + 0.04);
+      sub.frequency.exponentialRampToValueAtTime(48, now + 0.28);
+      subGain.gain.setValueAtTime(0.32, now + 0.04);
+      subGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+      sub.connect(subGain);
+      subGain.connect(ctx.destination);
+      sub.start(now + 0.04);
+      sub.stop(now + 0.31);
+    } else if (type === 'shieldBreak') {
+      const bufferSize = Math.floor(ctx.sampleRate * 0.32);
+      const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const output = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        output[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.08));
+      }
+      const whiteNoise = ctx.createBufferSource();
+      whiteNoise.buffer = noiseBuffer;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'highpass';
+      filter.frequency.setValueAtTime(1400, now);
+
+      const noiseGain = ctx.createGain();
+      noiseGain.gain.setValueAtTime(0.35, now);
+      noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
+
+      whiteNoise.connect(filter);
+      filter.connect(noiseGain);
+      noiseGain.connect(ctx.destination);
+      whiteNoise.start(now);
+
+      [1950, 2650, 3200].forEach((freq, i) => {
+        const shard = ctx.createOscillator();
+        const sGain = ctx.createGain();
+        shard.type = 'square';
+        shard.frequency.setValueAtTime(freq, now + i * 0.03);
+        shard.frequency.exponentialRampToValueAtTime(freq * 0.6, now + i * 0.03 + 0.12);
+        sGain.gain.setValueAtTime(0.08, now + i * 0.03);
+        sGain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.03 + 0.13);
+        shard.connect(sGain);
+        sGain.connect(ctx.destination);
+        shard.start(now + i * 0.03);
+        shard.stop(now + i * 0.03 + 0.14);
+      });
+    } else if (type === 'block') {
+      [320, 640, 1280].forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = idx === 0 ? 'square' : 'triangle';
+        osc.frequency.setValueAtTime(freq, now);
+        osc.frequency.exponentialRampToValueAtTime(freq * 0.85, now + 0.35);
+
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.4);
+      });
+    } else if (type === 'revZeroTrigger') {
+      const sweep = ctx.createOscillator();
+      const sGain = ctx.createGain();
+      sweep.type = 'sawtooth';
+      sweep.frequency.setValueAtTime(220, now);
+      sweep.frequency.exponentialRampToValueAtTime(1320, now + 0.35);
+      sGain.gain.setValueAtTime(0.25, now);
+      sGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+      sweep.connect(sGain);
+      sGain.connect(ctx.destination);
+      sweep.start(now);
+      sweep.stop(now + 0.44);
+
+      [880, 1174.66, 1760].forEach((freq, i) => {
+        const chime = ctx.createOscillator();
+        const cGain = ctx.createGain();
+        chime.type = 'triangle';
+        chime.frequency.setValueAtTime(freq, now + 0.25 + i * 0.04);
+        cGain.gain.setValueAtTime(0.22, now + 0.25 + i * 0.04);
+        cGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.75);
+        chime.connect(cGain);
+        cGain.connect(ctx.destination);
+        chime.start(now + 0.25 + i * 0.04);
+        chime.stop(now + 0.78);
+      });
+    } else if (type === 'directAttack') {
+      const expSize = Math.floor(ctx.sampleRate * 0.85);
+      const expBuffer = ctx.createBuffer(1, expSize, ctx.sampleRate);
+      const expData = expBuffer.getChannelData(0);
+      for (let i = 0; i < expSize; i++) {
+        expData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.25));
+      }
+      const expSource = ctx.createBufferSource();
+      expSource.buffer = expBuffer;
+
+      const lpFilter = ctx.createBiquadFilter();
+      lpFilter.type = 'lowpass';
+      lpFilter.frequency.setValueAtTime(900, now);
+      lpFilter.frequency.exponentialRampToValueAtTime(140, now + 0.8);
+
+      const expGain = ctx.createGain();
+      expGain.gain.setValueAtTime(0.5, now);
+      expGain.gain.exponentialRampToValueAtTime(0.001, now + 0.85);
+
+      expSource.connect(lpFilter);
+      lpFilter.connect(expGain);
+      expGain.connect(ctx.destination);
+      expSource.start(now);
+
+      const boom = ctx.createOscillator();
+      const boomGain = ctx.createGain();
+      boom.type = 'sawtooth';
+      boom.frequency.setValueAtTime(180, now);
+      boom.frequency.exponentialRampToValueAtTime(32, now + 0.75);
+      boomGain.gain.setValueAtTime(0.45, now);
+      boomGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.8);
+      boom.connect(boomGain);
+      boomGain.connect(ctx.destination);
+      boom.start(now);
+      boom.stop(now + 0.82);
+
+      const chord = [523.25, 659.25, 783.99, 1046.5];
+      chord.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        const startAt = now + 0.16 + idx * 0.045;
+        osc.frequency.setValueAtTime(freq, startAt);
+
+        gain.gain.setValueAtTime(0.001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.22, startAt + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.85);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(startAt);
+        osc.stop(startAt + 0.88);
+      });
+    }
   } catch (e) {
     console.warn('Sound playback skipped:', e);
   }
@@ -76,13 +253,14 @@ function compressImageToDataUrl(file: File, maxWidth = 420): Promise<string> {
   });
 }
 
-function createDeckInstances(cards: CardData[]): CardInstance[] {
-  const instances: CardInstance[] = cards.map((card, index) => ({
+function createDeckInstances(cards: CardData[]): BattleCardInstance[] {
+  const instances: BattleCardInstance[] = cards.map((card, index) => ({
     ...card,
     instanceId: `${card.id}-${index}-${Math.random().toString(36).substring(2, 7)}`,
     tapped: false,
     faceUp: false,
     underCards: [],
+    ignored: false,
   }));
   for (let i = instances.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -93,10 +271,10 @@ function createDeckInstances(cards: CardData[]): CardInstance[] {
 
 function createKindanCard(
   kindanType: KindanType | undefined,
-  seals: CardInstance[],
+  seals: BattleCardInstance[],
   frontImageUrl?: string,
   backImageUrl?: string
-): CardInstance | null {
+): BattleCardInstance | null {
   if (kindanType === 'dokindam') {
     return {
       instanceId: `kindan-dokindam-${Math.random().toString(36).substring(2, 7)}`,
@@ -114,6 +292,7 @@ function createKindanCard(
       underCards: seals,
       kindanRole: 'dokindam',
       kindanAwakened: false,
+      ignored: false,
     };
   }
   if (kindanType === 'dormageddon') {
@@ -133,6 +312,7 @@ function createKindanCard(
       underCards: seals,
       kindanRole: 'dormageddon',
       kindanAwakened: false,
+      ignored: false,
     };
   }
   return null;
@@ -144,14 +324,18 @@ function BattleRoomContent() {
   const searchParams = useSearchParams();
   const roomId = (params.roomId as string)?.trim();
 
-  const [room, setRoom] = useState<GameRoom | null>(null);
+  const [room, setRoom] = useState<(GameRoom & { pendingDirectAttack?: PendingDirectAttack | null }) | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   const [spectatorShowHands, setSpectatorShowHands] = useState<boolean>(true);
   const [isEvolvingBusy, setIsEvolvingBusy] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
+  const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
 
   const prevTurnCountRef = useRef<number | null>(null);
   const prevTurnPlayerRef = useRef<string | null>(null);
+  const prevSoundEventIdRef = useRef<string | null>(null);
+  const prevPendingDirectIdRef = useRef<string | null>(null);
   const soundEnabledRef = useRef<boolean>(true);
 
   useEffect(() => {
@@ -159,18 +343,18 @@ function BattleRoomContent() {
   }, [soundEnabled]);
 
   const [selectedCard, setSelectedCard] = useState<{
-    card: CardInstance;
+    card: BattleCardInstance;
     zone: ZoneType;
   } | null>(null);
 
   const [inspectCard, setInspectCard] = useState<{
-    card: CardInstance;
+    card: BattleCardInstance;
     ownerName: string;
     sourceZone?: ZoneType;
     isOpponentCard?: boolean;
   } | null>(null);
 
-  const [brokenShieldCard, setBrokenShieldCard] = useState<CardInstance | null>(null);
+  const [brokenShieldCard, setBrokenShieldCard] = useState<BattleCardInstance | null>(null);
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [deckSearchOpen, setDeckSearchOpen] = useState(false);
   const [graveSearchOpen, setGraveSearchOpen] = useState(false);
@@ -178,23 +362,35 @@ function BattleRoomContent() {
   const [peekCount, setPeekCount] = useState<number>(4);
 
   const [peekState, setPeekState] = useState<{
-    cards: CardInstance[];
+    cards: BattleCardInstance[];
     isPublic: boolean;
   } | null>(null);
 
   const [evolutionBuilder, setEvolutionBuilder] = useState<{
-    evolvingCard: CardInstance;
+    evolvingCard: BattleCardInstance;
     fromZone: 'hand' | 'mana' | 'graveyard';
     activeTab: EvolutionSourceZone;
     selectedMaterials: SelectedEvolutionMaterial[];
   } | null>(null);
 
   const [revolutionChangePending, setRevolutionChangePending] = useState<{
-    card: CardInstance;
+    card: BattleCardInstance;
     fromZone: 'hand' | 'mana' | 'graveyard';
   } | null>(null);
 
   const [resetting, setResetting] = useState(false);
+
+  const broadcastSound = async (type: SoundEventType) => {
+    if (!roomId) return;
+    const id = `${type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    prevSoundEventIdRef.current = id;
+    if (soundEnabledRef.current) {
+      playGameSound(type);
+    }
+    await update(ref(db, `rooms/${roomId}`), {
+      soundEvent: { id, type, timestamp: Date.now() },
+    });
+  };
 
   const setInspectingStatus = async (text: string | null) => {
     if (!roomId) return;
@@ -206,7 +402,7 @@ function BattleRoomContent() {
   const triggerCutIn = async (
     type: CutInEvent['type'],
     playerName: string,
-    card: CardInstance,
+    card: BattleCardInstance,
     subText?: string
   ) => {
     if (!roomId) return;
@@ -236,9 +432,9 @@ function BattleRoomContent() {
     const roomRef = ref(db, `rooms/${roomId}`);
     const unsubscribe = onValue(roomRef, (snapshot) => {
       if (snapshot.exists()) {
-        const data = snapshot.val() as GameRoom;
+        const raw = snapshot.val();
+        const data = raw as GameRoom & { pendingDirectAttack?: PendingDirectAttack | null };
 
-        // ターンエンド（ターン数増加またはターンプレイヤー交代）を検知して音を鳴らす
         if (
           prevTurnCountRef.current !== null &&
           prevTurnPlayerRef.current !== null &&
@@ -246,11 +442,32 @@ function BattleRoomContent() {
             data.turnPlayerId !== prevTurnPlayerRef.current)
         ) {
           if (soundEnabledRef.current) {
-            playTurnEndSound();
+            playGameSound('turnEnd');
           }
         }
         prevTurnCountRef.current = data.turnCount;
         prevTurnPlayerRef.current = data.turnPlayerId;
+
+        const se = raw.soundEvent as { id: string; type: SoundEventType; timestamp: number } | undefined;
+        if (se && se.id && se.id !== prevSoundEventIdRef.current) {
+          const isInitialLoad = prevSoundEventIdRef.current === null;
+          prevSoundEventIdRef.current = se.id;
+          if (!isInitialLoad || Date.now() - se.timestamp < 3000) {
+            if (soundEnabledRef.current) {
+              playGameSound(se.type);
+            }
+          }
+        } else if (!se && prevSoundEventIdRef.current === null) {
+          prevSoundEventIdRef.current = 'init';
+        }
+
+        const pda = data.pendingDirectAttack;
+        if (pda && pda.id !== prevPendingDirectIdRef.current) {
+          prevPendingDirectIdRef.current = pda.id;
+          setDefenseSubMode('main');
+        } else if (!pda) {
+          prevPendingDirectIdRef.current = null;
+        }
 
         setRoom(data);
       } else {
@@ -286,6 +503,16 @@ function BattleRoomContent() {
   const opponent: PlayerState | undefined = topPlayerId ? playersObj[topPlayerId] : undefined;
   const isMyTurn = !isSpectator && room.turnPlayerId === myPlayerId;
 
+  const pendingDirectAttack = room.pendingDirectAttack || null;
+  const amIDefendingDirectAttack =
+    !isSpectator &&
+    !!pendingDirectAttack &&
+    pendingDirectAttack.defenderPlayerId === myPlayerId;
+  const amIWaitingDirectAttack =
+    !isSpectator &&
+    !!pendingDirectAttack &&
+    pendingDirectAttack.attackerPlayerId === myPlayerId;
+
   const updateMyState = async (newState: Partial<PlayerState>, recordUndo = true) => {
     if (!me || isSpectator) return;
 
@@ -304,21 +531,46 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), newState);
   };
 
-  // 【禁断専用】封印を1枚外す（墓地へ送る）／山札から封印を1枚乗せる／禁断解放（裏返す）／裏面画像アップロード
-  const handleRemoveOneSeal = async (kindanCard: CardInstance) => {
+  // ★ 自分のクリーチャーの「暗くする（行動不能・無視） / 戻す」切り替え
+  const handleToggleMyIgnore = async (targetCard: BattleCardInstance) => {
+    if (!me || isSpectator) return;
+    const nextIgnored = !targetCard.ignored;
+    const updatedBZ = ((me.battleZone || []) as BattleCardInstance[]).map((c) =>
+      c.instanceId === targetCard.instanceId ? { ...c, ignored: nextIgnored } : c
+    );
+    await updateMyState({ battleZone: updatedBZ });
+    setSelectedCard(null);
+  };
+
+  // ★ 相手のクリーチャーの「暗くする（行動不能・無視） / 戻す」切り替え
+  const handleToggleOpponentIgnore = async (targetCard: BattleCardInstance) => {
+    if (!opponent || !topPlayerId || isSpectator) return;
+    const nextIgnored = !targetCard.ignored;
+    const updatedOppBZ = ((opponent.battleZone || []) as BattleCardInstance[]).map((c) =>
+      c.instanceId === targetCard.instanceId ? { ...c, ignored: nextIgnored } : c
+    );
+    await update(ref(db, `rooms/${roomId}/players/${topPlayerId}`), {
+      battleZone: updatedOppBZ,
+    });
+    setInspectCard(null);
+  };
+
+  // 【禁断専用】封印を1枚外す／乗せる／禁断解放／表裏画像アップロード
+  const handleRemoveOneSeal = async (kindanCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const seals = kindanCard.underCards || [];
     if (seals.length === 0) return alert('外せる封印がもうありません');
 
-    const removedSeal: CardInstance = {
+    const removedSeal: BattleCardInstance = {
       ...seals[seals.length - 1],
       faceUp: true,
       tapped: false,
       underCards: [],
+      ignored: false,
     };
     const remainingSeals = seals.slice(0, -1);
 
-    const updatedKindan: CardInstance = {
+    const updatedKindan: BattleCardInstance = {
       ...kindanCard,
       underCards: remainingSeals,
     };
@@ -336,19 +588,20 @@ function BattleRoomContent() {
     setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
   };
 
-  const handleAddOneSealFromDeck = async (kindanCard: CardInstance) => {
+  const handleAddOneSealFromDeck = async (kindanCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     if ((me.deck || []).length === 0) return alert('山札がありません');
 
     const nextDeck = [...(me.deck || [])];
-    const newSeal: CardInstance = {
+    const newSeal: BattleCardInstance = {
       ...nextDeck.shift()!,
       faceUp: false,
       tapped: false,
       underCards: [],
+      ignored: false,
     };
 
-    const updatedKindan: CardInstance = {
+    const updatedKindan: BattleCardInstance = {
       ...kindanCard,
       underCards: [...(kindanCard.underCards || []), newSeal],
     };
@@ -365,7 +618,7 @@ function BattleRoomContent() {
     setSelectedCard({ card: updatedKindan, zone: 'battleZone' });
   };
 
-  const handleToggleKindanAwaken = async (kindanCard: CardInstance) => {
+  const handleToggleKindanAwaken = async (kindanCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const nextAwakened = !kindanCard.kindanAwakened;
     const awakenedName =
@@ -377,7 +630,7 @@ function BattleRoomContent() {
         ? '終焉の禁断 ドルマゲドンX（禁断爆発！）'
         : 'FORBIDDEN STAR ～世界最後の日～';
 
-    const updatedKindan: CardInstance = {
+    const updatedKindan: BattleCardInstance = {
       ...kindanCard,
       name: awakenedName,
       kindanAwakened: nextAwakened,
@@ -403,14 +656,14 @@ function BattleRoomContent() {
   };
 
   const handleUploadKindanImageInRoom = async (
-    kindanCard: CardInstance,
+    kindanCard: BattleCardInstance,
     side: 'front' | 'back',
     file?: File
   ) => {
     if (!me || isSpectator || !file) return;
     try {
       const dataUrl = await compressImageToDataUrl(file);
-      const updatedKindan: CardInstance = {
+      const updatedKindan: BattleCardInstance = {
         ...kindanCard,
         ...(side === 'front'
           ? { imageUrl: dataUrl }
@@ -444,20 +697,19 @@ function BattleRoomContent() {
     }
   };
 
-  // 相手のクリーチャーを新しい表向きシールドとして相手シールドゾーンに追加
   const handleSendOpponentCardToFaceUpShield = async (
-    targetCard: CardInstance,
+    targetCard: BattleCardInstance,
     sourceZone: ZoneType
   ) => {
     if (!opponent || !topPlayerId || isSpectator) return;
 
-    const removeFrom = (list: CardInstance[]) =>
+    const removeFrom = (list: BattleCardInstance[]) =>
       list.filter((c) => c.instanceId !== targetCard.instanceId);
 
-    let nextOppBZ = [...(opponent.battleZone || [])];
-    let nextOppMana = [...(opponent.mana || [])];
-    let nextOppGrave = [...(opponent.graveyard || [])];
-    let nextOppShields = [...(opponent.shields || [])];
+    let nextOppBZ = [...((opponent.battleZone || []) as BattleCardInstance[])];
+    let nextOppMana = [...((opponent.mana || []) as BattleCardInstance[])];
+    let nextOppGrave = [...((opponent.graveyard || []) as BattleCardInstance[])];
+    let nextOppShields = [...((opponent.shields || []) as BattleCardInstance[])];
 
     if (sourceZone === 'battleZone') nextOppBZ = removeFrom(nextOppBZ);
     if (sourceZone === 'mana') nextOppMana = removeFrom(nextOppMana);
@@ -470,15 +722,17 @@ function BattleRoomContent() {
         tapped: false,
         faceUp: true,
         underCards: [],
+        ignored: false,
       }));
       nextOppGrave.push(...freedUnder);
     }
 
-    const faceUpShieldCard: CardInstance = {
+    const faceUpShieldCard: BattleCardInstance = {
       ...targetCard,
       tapped: false,
       faceUp: true,
       underCards: [],
+      ignored: false,
     };
     nextOppShields.push(faceUpShieldCard);
 
@@ -510,11 +764,11 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}`), {
       inspectingText: null,
       publicReveal: null,
+      pendingDirectAttack: null,
     });
     await update(ref(db, `rooms/${roomId}/players/${myPlayerId}`), restored);
   };
 
-  // 【試合リセット】ドキンダムX / ドルマゲドンXの初期封印＆表裏画像も含めて完全に最初からやり直す
   const handleResetMatch = async () => {
     if (isSpectator) return;
     if (
@@ -583,7 +837,7 @@ function BattleRoomContent() {
           (kType === 'dokindam' ? sharedImgs.dokindamBack : sharedImgs.dormageddonBack) ||
           '';
 
-        const initialBZ: CardInstance[] = [];
+        const initialBZ: BattleCardInstance[] = [];
         const kindanCard = createKindanCard(kType, seals, frontImg, backImg);
         if (kindanCard) {
           initialBZ.push(kindanCard);
@@ -608,6 +862,7 @@ function BattleRoomContent() {
         inspectingText: null,
         cutIn: null,
         publicReveal: null,
+        pendingDirectAttack: null,
       });
 
       setUndoStack([]);
@@ -623,21 +878,20 @@ function BattleRoomContent() {
     }
   };
 
-  const deck = me?.deck || [];
-  const hand = me?.hand || [];
-  const mana = me?.mana || [];
-  const shields = me?.shields || [];
-  const battleZone = me?.battleZone || [];
-  const graveyard = me?.graveyard || [];
+  const deck = (me?.deck || []) as BattleCardInstance[];
+  const hand = (me?.hand || []) as BattleCardInstance[];
+  const mana = (me?.mana || []) as BattleCardInstance[];
+  const shields = (me?.shields || []) as BattleCardInstance[];
+  const battleZone = (me?.battleZone || []) as BattleCardInstance[];
+  const graveyard = (me?.graveyard || []) as BattleCardInstance[];
 
-  const oppDeck = opponent?.deck || [];
-  const oppHand = opponent?.hand || [];
-  const oppMana = opponent?.mana || [];
-  const oppShields = opponent?.shields || [];
-  const oppBattleZone = opponent?.battleZone || [];
-  const oppGraveyard = opponent?.graveyard || [];
+  const oppDeck = (opponent?.deck || []) as BattleCardInstance[];
+  const oppHand = (opponent?.hand || []) as BattleCardInstance[];
+  const oppMana = (opponent?.mana || []) as BattleCardInstance[];
+  const oppShields = (opponent?.shields || []) as BattleCardInstance[];
+  const oppBattleZone = (opponent?.battleZone || []) as BattleCardInstance[];
+  const oppGraveyard = (opponent?.graveyard || []) as BattleCardInstance[];
 
-  // バトルゾーンを「通常クリーチャー」と「右端固定の禁断カード」に分離
   const normalBattleZone = battleZone.filter((c) => !c.kindanRole);
   const kindanBattleZone = battleZone.find((c) => c.kindanRole);
 
@@ -648,10 +902,11 @@ function BattleRoomContent() {
     if (!me || isSpectator || deck.length === 0) return alert('山札がありません');
     const newDeck = [...deck];
     const topCard = newDeck.shift()!;
-    const updatedCard: CardInstance = {
+    const updatedCard: BattleCardInstance = {
       ...topCard,
       tapped: false,
       faceUp: dest !== 'shields',
+      ignored: false,
     };
 
     if (dest === 'hand') {
@@ -679,7 +934,7 @@ function BattleRoomContent() {
   const handleTurnStart = async () => {
     if (!me || isSpectator) return;
     const untappedMana = mana.map((c) => ({ ...c, tapped: false }));
-    const untappedBZ = battleZone.map((c) => ({ ...c, tapped: false }));
+    const untappedBZ = battleZone.map((c) => ({ ...c, tapped: false, ignored: false }));
     const newDeck = [...deck];
     const newHand = [...hand];
     if (newDeck.length > 0) {
@@ -701,6 +956,7 @@ function BattleRoomContent() {
     await update(ref(db, `rooms/${roomId}`), {
       turnPlayerId: topPlayerId,
       turnCount: (room.turnCount || 1) + 1,
+      pendingDirectAttack: null,
     });
   };
 
@@ -728,12 +984,17 @@ function BattleRoomContent() {
   };
 
   const handleMoveFromPeek = async (
-    picked: CardInstance,
+    picked: BattleCardInstance,
     dest: 'hand' | 'battleZone' | 'mana' | 'graveyard'
   ) => {
     if (!peekState || !me || isSpectator) return;
     const remaining = peekState.cards.filter((c) => c.instanceId !== picked.instanceId);
-    const updatedCard: CardInstance = { ...picked, faceUp: true, tapped: false };
+    const updatedCard: BattleCardInstance = {
+      ...picked,
+      faceUp: true,
+      tapped: false,
+      ignored: false,
+    };
 
     if (dest === 'hand') {
       await updateMyState({ hand: [...hand, updatedCard] });
@@ -786,13 +1047,13 @@ function BattleRoomContent() {
   };
 
   const moveCard = async (
-    card: CardInstance,
+    card: BattleCardInstance,
     fromZone: ZoneType,
     toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom'
   ) => {
     if (!me || isSpectator) return;
 
-    const removeFrom = (list: CardInstance[]) =>
+    const removeFrom = (list: BattleCardInstance[]) =>
       list.filter((c) => c.instanceId !== card.instanceId);
 
     let nextDeck = [...deck];
@@ -811,11 +1072,12 @@ function BattleRoomContent() {
     const isFaceUpDest =
       toZone !== 'shields' && toZone !== 'deckTop' && toZone !== 'deckBottom';
 
-    const cleanCard: CardInstance = {
+    const cleanCard: BattleCardInstance = {
       ...card,
       tapped: false,
       faceUp: isFaceUpDest,
       underCards: toZone === 'battleZone' ? card.underCards || [] : [],
+      ignored: false,
     };
 
     if (toZone === 'hand') nextHand.push(cleanCard);
@@ -857,7 +1119,7 @@ function BattleRoomContent() {
     }
   };
 
-  const toggleTap = async (card: CardInstance, zone: 'mana' | 'battleZone') => {
+  const toggleTap = async (card: BattleCardInstance, zone: 'mana' | 'battleZone') => {
     if (!me || isSpectator) return;
     const list = zone === 'mana' ? mana : battleZone;
     const updated = list.map((c) =>
@@ -867,7 +1129,7 @@ function BattleRoomContent() {
     setSelectedCard(null);
   };
 
-  const handleAttackDeclare = async (attacker: CardInstance) => {
+  const handleAttackDeclare = async (attacker: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
@@ -875,17 +1137,129 @@ function BattleRoomContent() {
     await updateMyState({ battleZone: updatedBZ });
     setSelectedCard(null);
 
+    await broadcastSound('attack');
     await triggerCutIn('attack', me.name, attacker, 'クリーチャーで攻撃宣言！');
   };
 
-  const handleBreakShield = async (card: CardInstance) => {
+  const handleDeclareDirectAttack = async (attacker: BattleCardInstance) => {
+    if (!me || isSpectator) return;
+    if (!topPlayerId) return alert('対戦相手がまだいません');
+
+    const updatedBZ = battleZone.map((c) =>
+      c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
+    );
+    await updateMyState({ battleZone: updatedBZ });
+    setDirectAttackModalOpen(false);
+    setSelectedCard(null);
+
+    const pendingPayload: PendingDirectAttack = {
+      id: `da-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      attackerPlayerId: myPlayerId,
+      attackerPlayerName: me.name,
+      defenderPlayerId: topPlayerId,
+      card: attacker,
+      timestamp: Date.now(),
+    };
+
+    await broadcastSound('attack');
+    await update(ref(db, `rooms/${roomId}`), {
+      pendingDirectAttack: pendingPayload,
+    });
+    await triggerCutIn(
+      'attack',
+      me.name,
+      attacker,
+      '⚠️ ダイレクトアタック宣言！！相手の対応待ち...'
+    );
+  };
+
+  const handleAcceptDefeat = async () => {
+    if (!pendingDirectAttack || !me) return;
+    const { attackerPlayerName, card } = pendingDirectAttack;
+
+    await update(ref(db, `rooms/${roomId}`), {
+      pendingDirectAttack: null,
+    });
+    await broadcastSound('directAttack');
+    await triggerCutIn(
+      'attack',
+      attackerPlayerName,
+      card,
+      `🏆 決着！！${me.name} が敗北を認めた！（${attackerPlayerName} の勝利！）`
+    );
+  };
+
+  const handleActivateRevZeroTrigger = async (
+    card: BattleCardInstance,
+    dest: 'battleZone' | 'graveyard'
+  ) => {
+    if (!me || !pendingDirectAttack) return;
+
+    const nextHand = hand.filter((c) => c.instanceId !== card.instanceId);
+    const cleanCard: BattleCardInstance = {
+      ...card,
+      tapped: false,
+      faceUp: true,
+      underCards: [],
+      ignored: false,
+    };
+
+    if (dest === 'battleZone') {
+      const cleanBZ = battleZone.filter((c) => c.instanceId !== cleanCard.instanceId);
+      await updateMyState({
+        hand: nextHand,
+        battleZone: [...cleanBZ, cleanCard],
+      });
+    } else {
+      await updateMyState({
+        hand: nextHand,
+        graveyard: [...graveyard, cleanCard],
+      });
+    }
+
+    await update(ref(db, `rooms/${roomId}`), {
+      pendingDirectAttack: null,
+    });
+    await broadcastSound('revZeroTrigger');
+    await triggerCutIn(
+      'trigger',
+      me.name,
+      cleanCard,
+      dest === 'battleZone'
+        ? '🔥 革命0トリガー発動！！バトルゾーンへ降臨！'
+        : '🔥 革命0トリガー呪文発動！！'
+    );
+  };
+
+  const handleBlockDirectAttack = async (blocker: BattleCardInstance) => {
+    if (!me || !pendingDirectAttack) return;
+
+    const updatedBZ = battleZone.map((c) =>
+      c.instanceId === blocker.instanceId ? { ...c, tapped: true } : c
+    );
+    await updateMyState({ battleZone: updatedBZ });
+
+    await update(ref(db, `rooms/${roomId}`), {
+      pendingDirectAttack: null,
+    });
+    await broadcastSound('block');
+    await triggerCutIn(
+      'ability',
+      me.name,
+      blocker,
+      '🛡️ ブロッカー発動！ダイレクトアタックをブロック！！'
+    );
+  };
+
+  const handleBreakShield = async (card: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const nextShields = shields.filter((c) => c.instanceId !== card.instanceId);
-    const addedToHand: CardInstance = {
+    const addedToHand: BattleCardInstance = {
       ...card,
       faceUp: true,
       tapped: false,
       underCards: [],
+      ignored: false,
     };
     const nextHand = [...hand, addedToHand];
 
@@ -894,10 +1268,11 @@ function BattleRoomContent() {
       hand: nextHand,
     });
 
+    await broadcastSound('shieldBreak');
     setBrokenShieldCard(addedToHand);
   };
 
-  const toggleEvolutionMaterial = (card: CardInstance, sourceZone: EvolutionSourceZone) => {
+  const toggleEvolutionMaterial = (card: BattleCardInstance, sourceZone: EvolutionSourceZone) => {
     if (!evolutionBuilder) return;
     const exists = evolutionBuilder.selectedMaterials.some(
       (m) => m.card.instanceId === card.instanceId
@@ -912,7 +1287,6 @@ function BattleRoomContent() {
     });
   };
 
-  // ★ 進化確定処理（二重発火・複製バグを完全防止）
   const handleConfirmFreeEvolution = async () => {
     if (!me || isSpectator || !evolutionBuilder || isEvolvingBusy) return;
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
@@ -937,7 +1311,7 @@ function BattleRoomContent() {
         nextGrave = nextGrave.filter((c) => c.instanceId !== evolvingCard.instanceId);
       }
 
-      const collectedUnderCards: CardInstance[] = [];
+      const collectedUnderCards: BattleCardInstance[] = [];
       let inheritedTapState = false;
       let firstBZAnchorId: string | null = null;
       const bzIdsToRemove = new Set<string>();
@@ -959,31 +1333,63 @@ function BattleRoomContent() {
                   tapped: false,
                   faceUp: true,
                   underCards: [],
+                  ignored: false,
                 }))
               );
             }
-            collectedUnderCards.push({ ...found, tapped: false, faceUp: true, underCards: [] });
+            collectedUnderCards.push({
+              ...found,
+              tapped: false,
+              faceUp: true,
+              underCards: [],
+              ignored: false,
+            });
           }
         } else if (mat.sourceZone === 'mana') {
           nextMana = nextMana.filter((c) => c.instanceId !== mat.card.instanceId);
-          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+          collectedUnderCards.push({
+            ...mat.card,
+            tapped: false,
+            faceUp: true,
+            underCards: [],
+            ignored: false,
+          });
         } else if (mat.sourceZone === 'graveyard') {
           nextGrave = nextGrave.filter((c) => c.instanceId !== mat.card.instanceId);
-          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+          collectedUnderCards.push({
+            ...mat.card,
+            tapped: false,
+            faceUp: true,
+            underCards: [],
+            ignored: false,
+          });
         } else if (mat.sourceZone === 'hand') {
           nextHand = nextHand.filter((c) => c.instanceId !== mat.card.instanceId);
-          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+          collectedUnderCards.push({
+            ...mat.card,
+            tapped: false,
+            faceUp: true,
+            underCards: [],
+            ignored: false,
+          });
         } else if (mat.sourceZone === 'deck') {
           nextDeck = nextDeck.filter((c) => c.instanceId !== mat.card.instanceId);
-          collectedUnderCards.push({ ...mat.card, tapped: false, faceUp: true, underCards: [] });
+          collectedUnderCards.push({
+            ...mat.card,
+            tapped: false,
+            faceUp: true,
+            underCards: [],
+            ignored: false,
+          });
         }
       }
 
-      const evolvedCard: CardInstance = {
+      const evolvedCard: BattleCardInstance = {
         ...evolvingCard,
         tapped: inheritedTapState,
         faceUp: true,
         underCards: collectedUnderCards,
+        ignored: false,
       };
 
       if (firstBZAnchorId) {
@@ -1025,7 +1431,7 @@ function BattleRoomContent() {
     }
   };
 
-  const handleExecuteRevolutionChange = async (targetCard: CardInstance) => {
+  const handleExecuteRevolutionChange = async (targetCard: BattleCardInstance) => {
     if (!me || isSpectator || !revolutionChangePending) return;
     const { card: incomingCard, fromZone } = revolutionChangePending;
 
@@ -1041,22 +1447,24 @@ function BattleRoomContent() {
       nextGrave = nextGrave.filter((c) => c.instanceId !== incomingCard.instanceId);
     }
 
-    const returnedCards: CardInstance[] = [
-      { ...targetCard, tapped: false, faceUp: true, underCards: [] },
+    const returnedCards: BattleCardInstance[] = [
+      { ...targetCard, tapped: false, faceUp: true, underCards: [], ignored: false },
       ...(targetCard.underCards || []).map((u) => ({
         ...u,
         tapped: false,
         faceUp: true,
         underCards: [],
+        ignored: false,
       })),
     ];
     nextHand = [...nextHand, ...returnedCards];
 
-    const changedCard: CardInstance = {
+    const changedCard: BattleCardInstance = {
       ...incomingCard,
       tapped: targetCard.tapped,
       faceUp: true,
       underCards: [],
+      ignored: false,
     };
 
     const nextBZ = battleZone
@@ -1082,19 +1490,24 @@ function BattleRoomContent() {
   };
 
   const handleExtractUnderCard = async (
-    topCard: CardInstance,
-    underCard: CardInstance,
+    topCard: BattleCardInstance,
+    underCard: BattleCardInstance,
     dest: 'hand' | 'graveyard' | 'mana'
   ) => {
     if (!me || isSpectator) return;
     const remainingUnder = (topCard.underCards || []).filter(
       (u) => u.instanceId !== underCard.instanceId
     );
-    const updatedTop: CardInstance = { ...topCard, underCards: remainingUnder };
+    const updatedTop: BattleCardInstance = { ...topCard, underCards: remainingUnder };
     const nextBZ = battleZone.map((c) =>
       c.instanceId === topCard.instanceId ? updatedTop : c
     );
-    const movedUnder: CardInstance = { ...underCard, tapped: false, faceUp: true };
+    const movedUnder: BattleCardInstance = {
+      ...underCard,
+      tapped: false,
+      faceUp: true,
+      ignored: false,
+    };
 
     await updateMyState({
       battleZone: nextBZ,
@@ -1107,15 +1520,16 @@ function BattleRoomContent() {
   };
 
   const handleMoveFromDeckSearch = async (
-    card: CardInstance,
+    card: BattleCardInstance,
     toZone: 'hand' | 'battleZone' | 'mana' | 'graveyard' | 'shields'
   ) => {
     if (!me || isSpectator) return;
     const nextDeck = deck.filter((c) => c.instanceId !== card.instanceId);
-    const updatedCard: CardInstance = {
+    const updatedCard: BattleCardInstance = {
       ...card,
       tapped: false,
       faceUp: toZone !== 'shields',
+      ignored: false,
     };
 
     if (toZone === 'hand') {
@@ -1133,9 +1547,8 @@ function BattleRoomContent() {
     }
   };
 
-  // カード表示コンポーネント（ドキンダムX / ドルマゲドンX 表裏画像＆封印枚数表示対応）
   const renderCard = (
-    card: CardInstance,
+    card: BattleCardInstance,
     zone: ZoneType,
     isControllable: boolean,
     ownerName: string,
@@ -1148,6 +1561,7 @@ function BattleRoomContent() {
     const underCount = card.underCards?.length || 0;
     const canClick = isControllable || showFace;
     const isKindan = !!card.kindanRole;
+    const isIgnored = zone === 'battleZone' && !!card.ignored;
 
     const kindanDisplayImage = isKindan
       ? card.kindanAwakened
@@ -1201,11 +1615,11 @@ function BattleRoomContent() {
           setSelectedCard({ card, zone });
         }}
         title={showFace ? `${card.name}（タップで操作・拡大）` : '裏向きカード'}
-        className={`relative select-none transition-transform shrink-0 ${
+        className={`relative select-none transition-all shrink-0 ${
           canClick ? 'cursor-pointer active:scale-95' : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
-          underCount > 0 ? 'mt-2 ml-1.5' : ''
-        }`}
+          isIgnored ? 'brightness-50 saturate-50' : ''
+        } ${underCount > 0 ? 'mt-2 ml-1.5' : ''}`}
       >
         {underCount > 0 && (
           <div
@@ -1229,6 +1643,8 @@ function BattleRoomContent() {
               ? `w-14 h-20 sm:w-16 sm:h-24 bg-slate-800 ${
                   zone === 'shields'
                     ? 'border-2 border-amber-400 ring-2 ring-amber-400/50'
+                    : isIgnored
+                    ? 'border border-slate-600'
                     : 'border border-slate-400'
                 } text-white`
               : 'w-12 h-16 sm:w-14 sm:h-20 bg-indigo-950 border-2 border-amber-500/70 text-amber-300 items-center justify-center'
@@ -1299,12 +1715,22 @@ function BattleRoomContent() {
                     進化+{underCount}
                   </span>
                 )}
+                {isIgnored && (
+                  <span className="absolute bottom-0.5 right-0.5 bg-slate-950/90 border border-slate-400/70 text-slate-200 text-[8px] font-extrabold px-1 rounded shadow">
+                    🌑無視
+                  </span>
+                )}
               </>
             ) : (
               <div className="p-1 flex flex-col justify-center items-center h-full">
                 <div className="text-[9px] font-bold leading-tight line-clamp-3 text-center">
                   {card.name}
                 </div>
+                {isIgnored && (
+                  <span className="mt-1 bg-slate-950 text-slate-300 text-[8px] px-1 rounded">
+                    🌑無視
+                  </span>
+                )}
               </div>
             )
           ) : (
@@ -1324,7 +1750,7 @@ function BattleRoomContent() {
   const activePublicReveal =
     room.publicReveal && room.publicReveal.playerName !== me?.name ? room.publicReveal : null;
 
-  const getEvolutionCandidates = (): CardInstance[] => {
+  const getEvolutionCandidates = (): BattleCardInstance[] => {
     if (!evolutionBuilder) return [];
     const excludeId = evolutionBuilder.evolvingCard.instanceId;
     if (evolutionBuilder.activeTab === 'battleZone') {
@@ -1384,9 +1810,9 @@ function BattleRoomContent() {
             onClick={() => {
               const next = !soundEnabled;
               setSoundEnabled(next);
-              if (next) playTurnEndSound();
+              if (next) playGameSound('turnEnd');
             }}
-            title="ターンエンド効果音のON/OFF"
+            title="効果音のON/OFF"
             className={`px-2.5 py-1.5 rounded text-xs font-bold border transition ${
               soundEnabled
                 ? 'bg-slate-800 hover:bg-slate-700 border-amber-400/60 text-amber-300'
@@ -1398,6 +1824,13 @@ function BattleRoomContent() {
 
           {!isSpectator && (
             <>
+              <button
+                type="button"
+                onClick={() => setDirectAttackModalOpen(true)}
+                className="px-3 py-1.5 bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white border border-yellow-300/80 rounded text-xs font-extrabold shadow-md animate-pulse"
+              >
+                💥 ダイレクトアタック
+              </button>
               <button
                 onClick={handleUndo}
                 disabled={undoStack.length === 0}
@@ -1459,6 +1892,26 @@ function BattleRoomContent() {
           </button>
         </div>
       </header>
+
+      {/* ダイレクトアタック宣言送信後の待機バナー（攻撃側） */}
+      {amIWaitingDirectAttack && pendingDirectAttack && (
+        <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-amber-400 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-amber-200 animate-pulse">
+          <span>
+            ⚔️ 「{pendingDirectAttack.card.name}」でダイレクトアタック宣言中！相手の対応（敗北宣言 / 革命0トリガー / ブロック）を待っています...
+          </span>
+          <button
+            type="button"
+            onClick={async () => {
+              await update(ref(db, `rooms/${roomId}`), {
+                pendingDirectAttack: null,
+              });
+            }}
+            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] shrink-0 text-slate-200"
+          >
+            取り消し
+          </button>
+        </div>
+      )}
 
       {room.inspectingText && (
         <div className="my-1.5 py-1.5 px-4 bg-sky-900/90 border border-sky-400 rounded-lg text-center text-xs sm:text-sm font-bold text-sky-200 animate-pulse">
@@ -1565,7 +2018,7 @@ function BattleRoomContent() {
         <div className="flex items-center justify-between gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded">
           <div className="flex flex-wrap gap-2 items-center flex-1">
             <span className="text-[10px] text-slate-400 mr-1">
-              バトルゾーン (タップで能力拡大＆シールド送り):
+              バトルゾーン (タップで能力拡大・行動不能化・盾送り):
             </span>
             {oppNormalBattleZone.map((c) =>
               renderCard(c, 'battleZone', false, opponent?.name || '相手')
@@ -1742,6 +2195,256 @@ function BattleRoomContent() {
         </div>
       </section>
 
+      {/* ================= 【防御側専用】ダイレクトアタック迎撃・敗北選択モーダル ================= */}
+      {amIDefendingDirectAttack && pendingDirectAttack && (
+        <div className="fixed inset-0 bg-black/90 flex items-center justify-center p-3 sm:p-4 z-50">
+          <div className="bg-gradient-to-b from-rose-950 via-slate-900 to-slate-950 border-2 border-rose-500 rounded-2xl p-4 sm:p-5 max-w-lg w-full max-h-[92vh] overflow-y-auto space-y-4 shadow-2xl">
+            <div className="text-center space-y-1">
+              <span className="inline-block px-3 py-0.5 bg-rose-600 text-white text-xs font-extrabold rounded-full animate-bounce">
+                🚨 絶体絶命！ダイレクトアタックを受けた！
+              </span>
+              <h3 className="font-extrabold text-base sm:text-lg text-amber-300">
+                {pendingDirectAttack.attackerPlayerName} の「{pendingDirectAttack.card.name}」がとどめを刺しに来た！
+              </h3>
+            </div>
+
+            {pendingDirectAttack.card.imageUrl && (
+              <div className="flex justify-center">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={pendingDirectAttack.card.imageUrl}
+                  alt={pendingDirectAttack.card.name}
+                  className="w-28 h-40 object-contain rounded-xl border-2 border-rose-400 bg-slate-950 shadow-xl"
+                />
+              </div>
+            )}
+
+            {defenseSubMode === 'main' && (
+              <div className="space-y-2.5">
+                <button
+                  type="button"
+                  onClick={handleAcceptDefeat}
+                  className="w-full py-3.5 px-4 bg-gradient-to-r from-slate-800 via-rose-900 to-slate-800 hover:from-rose-800 hover:to-rose-700 border-2 border-rose-400 rounded-xl text-sm sm:text-base font-extrabold text-white shadow-lg transition transform active:scale-95"
+                >
+                  💀 敗北を認める（もうこれ以上あがけない…）
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setDefenseSubMode('revZero')}
+                  className="w-full py-3.5 px-4 bg-gradient-to-r from-amber-500 via-orange-500 to-red-600 hover:from-amber-400 hover:to-red-500 text-slate-950 rounded-xl text-sm sm:text-base font-extrabold shadow-lg transition transform active:scale-95"
+                >
+                  🔥 革命0トリガーを発動する！（手札から選択）
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setDefenseSubMode('blocker')}
+                  className="w-full py-3.5 px-4 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white border border-sky-300/60 rounded-xl text-sm sm:text-base font-extrabold shadow-lg transition transform active:scale-95"
+                >
+                  🛡️ ブロッカーでブロックする！（場のクリーチャー）
+                </button>
+              </div>
+            )}
+
+            {defenseSubMode === 'revZero' && (
+              <div className="space-y-3 bg-slate-950/80 p-3 rounded-xl border border-amber-400/50">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-extrabold text-amber-300">
+                    🔥 手札から革命0トリガーとして使うカードを選択
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setDefenseSubMode('main')}
+                    className="px-2.5 py-1 bg-slate-700 rounded text-xs font-bold"
+                  >
+                    ← 戻る
+                  </button>
+                </div>
+
+                {hand.length === 0 ? (
+                  <p className="text-center text-xs text-slate-400 py-4">手札がありません</p>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[45vh] overflow-y-auto">
+                    {hand.map((c) => (
+                      <div
+                        key={c.instanceId}
+                        className="bg-slate-800 border border-amber-400/60 rounded-lg p-2 flex flex-col items-center space-y-1.5"
+                      >
+                        {c.imageUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={c.imageUrl}
+                            alt={c.name}
+                            className="w-16 h-22 object-cover rounded"
+                          />
+                        ) : (
+                          <div className="w-16 h-22 bg-slate-700 rounded flex items-center justify-center text-[10px] p-1 text-center">
+                            {c.name}
+                          </div>
+                        )}
+                        <div className="text-[10px] font-bold truncate w-full text-center">
+                          {c.name}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleActivateRevZeroTrigger(c, 'battleZone')}
+                          className="w-full py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded text-[10px] font-extrabold"
+                        >
+                          場に出す
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleActivateRevZeroTrigger(c, 'graveyard')}
+                          className="w-full py-1 bg-sky-600 hover:bg-sky-500 text-white rounded text-[10px] font-bold"
+                        >
+                          呪文詠唱(墓地)
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {defenseSubMode === 'blocker' && (
+              <div className="space-y-3 bg-slate-950/80 p-3 rounded-xl border border-sky-400/50">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-extrabold text-sky-300">
+                    🛡️ ブロックする自分のクリーチャーを選択（タップされます）
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setDefenseSubMode('main')}
+                    className="px-2.5 py-1 bg-slate-700 rounded text-xs font-bold"
+                  >
+                    ← 戻る
+                  </button>
+                </div>
+
+                {battleZone.length === 0 ? (
+                  <p className="text-center text-xs text-slate-400 py-4">
+                    バトルゾーンにクリーチャーがいません
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[45vh] overflow-y-auto">
+                    {battleZone.map((c) => {
+                      const img =
+                        c.kindanRole && c.kindanAwakened && c.kindanAwakenedImageUrl
+                          ? c.kindanAwakenedImageUrl
+                          : c.imageUrl;
+                      return (
+                        <button
+                          key={c.instanceId}
+                          type="button"
+                          onClick={() => handleBlockDirectAttack(c)}
+                          className={`bg-slate-800 hover:bg-sky-900 border border-sky-400/70 rounded-lg p-2 flex flex-col items-center space-y-1.5 transition ${
+                            c.ignored ? 'brightness-50' : ''
+                          }`}
+                        >
+                          {img ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={img}
+                              alt={c.name}
+                              className="w-16 h-22 object-cover rounded"
+                            />
+                          ) : (
+                            <div className="w-16 h-22 bg-slate-700 rounded flex items-center justify-center text-[10px] p-1 text-center">
+                              {c.name}
+                            </div>
+                          )}
+                          <div className="text-[10px] font-bold truncate w-full text-center">
+                            {c.ignored ? `🌑[無視] ${c.name}` : c.name}
+                          </div>
+                          <span className="w-full py-1 bg-sky-500 text-slate-950 rounded text-[10px] font-extrabold">
+                            🛡️ ブロックする
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ================= ダイレクトアタック宣言クリーチャー選択モーダル（攻撃側） ================= */}
+      {!isSpectator && directAttackModalOpen && (
+        <div
+          onClick={() => setDirectAttackModalOpen(false)}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-yellow-400 rounded-2xl p-4 sm:p-5 max-w-lg w-full space-y-4 shadow-2xl"
+          >
+            <div className="text-center space-y-1">
+              <h3 className="font-extrabold text-lg text-yellow-300">
+                💥 ダイレクトアタックするクリーチャーを選択！
+              </h3>
+              <p className="text-xs text-slate-300">
+                選択すると相手の画面に「敗北を認める / 革命0トリガー / ブロック」の最終選択が出現します！
+              </p>
+            </div>
+
+            {battleZone.length === 0 ? (
+              <p className="text-center text-xs text-slate-400 py-6">
+                バトルゾーンにクリーチャーがいません
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-[60vh] overflow-y-auto p-1">
+                {battleZone.map((c) => {
+                  const displayImg =
+                    c.kindanRole && c.kindanAwakened && c.kindanAwakenedImageUrl
+                      ? c.kindanAwakenedImageUrl
+                      : c.imageUrl;
+                  return (
+                    <button
+                      key={c.instanceId}
+                      type="button"
+                      onClick={() => handleDeclareDirectAttack(c)}
+                      className={`bg-gradient-to-b from-rose-900/90 to-slate-900 hover:from-rose-700 hover:to-amber-900 border-2 border-amber-400 rounded-xl p-2 flex flex-col items-center space-y-1.5 transition transform hover:scale-105 active:scale-95 shadow-lg ${
+                        c.ignored ? 'brightness-50' : ''
+                      }`}
+                    >
+                      {displayImg ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={displayImg}
+                          alt={c.name}
+                          className="w-20 h-28 object-cover rounded border border-yellow-300/60"
+                        />
+                      ) : (
+                        <div className="w-20 h-28 bg-slate-800 rounded flex items-center justify-center text-xs font-bold p-1 text-center">
+                          {c.name}
+                        </div>
+                      )}
+                      <span className="text-xs font-extrabold text-white truncate w-full text-center">
+                        {c.ignored ? `🌑[無視] ${c.name}` : c.name}
+                      </span>
+                      <span className="px-2 py-0.5 bg-yellow-400 text-slate-950 rounded text-[10px] font-extrabold">
+                        💥 とどめを刺す！
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setDirectAttackModalOpen(false)}
+              className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs font-bold"
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ================= シールドブレイク後の秘匿確認モーダル ================= */}
       {!isSpectator && brokenShieldCard && (
         <div
@@ -1820,7 +2523,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー＆シールド貼り付け ================= */}
+      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー＆暗転＆シールド貼り付け ================= */}
       {inspectCard && (
         <div
           onClick={() => setInspectCard(null)}
@@ -1892,6 +2595,24 @@ function BattleRoomContent() {
                 )}
               </div>
             )}
+
+            {/* 相手のバトルゾーンのクリーチャーを「暗くする（行動不能・無視） / 戻す」 */}
+            {!isSpectator &&
+              inspectCard.isOpponentCard &&
+              inspectCard.sourceZone === 'battleZone' && (
+                <button
+                  onClick={() => handleToggleOpponentIgnore(inspectCard.card)}
+                  className={`w-full py-2.5 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition ${
+                    inspectCard.card.ignored
+                      ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
+                      : 'bg-slate-700 hover:bg-slate-600 border border-slate-400 text-white'
+                  }`}
+                >
+                  {inspectCard.card.ignored
+                    ? '☀️ 元の明るさに戻す（行動不能・無視を解除）'
+                    : '🌑 暗くする（行動不能・無視する目印）'}
+                </button>
+              )}
 
             {!isSpectator &&
               inspectCard.isOpponentCard &&
@@ -2037,7 +2758,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル（ドキンダムX / ドルマゲドンX専用操作＆裏返し画像設定付き） ================= */}
+      {/* ================= 自分のカード超拡大＆全ゾーン万能移動モーダル ================= */}
       {!isSpectator && selectedCard && (
         <div
           onClick={() => setSelectedCard(null)}
@@ -2094,7 +2815,6 @@ function BattleRoomContent() {
               )}
             </div>
 
-            {/* ドキンダムX / ドルマゲドンX 専用の封印取り外し＆禁断解放＆表裏画像設定パネル */}
             {selectedCard.card.kindanRole && (
               <div className="bg-rose-950/70 border border-rose-500/60 rounded-xl p-2.5 space-y-2">
                 <div className="text-[11px] font-bold text-rose-200 text-center">
@@ -2131,7 +2851,6 @@ function BattleRoomContent() {
                     : '💀 禁断爆発！（終焉の禁断 ドルマゲドンXに裏返す）'}
                 </button>
 
-                {/* 部屋内から表画像・裏返り画像を直接セット／変更可能 */}
                 <div className="grid grid-cols-2 gap-2 pt-1 border-t border-rose-500/30 text-[11px] font-bold">
                   <label className="py-1.5 px-2 bg-sky-700 hover:bg-sky-600 text-white rounded-lg text-center cursor-pointer">
                     📷 鼓動面(表)画像
@@ -2288,6 +3007,12 @@ function BattleRoomContent() {
                     🔥 攻撃する（タップ＆カード提示）
                   </button>
                   <button
+                    onClick={() => handleDeclareDirectAttack(selectedCard.card)}
+                    className="py-2 bg-gradient-to-r from-red-600 to-amber-500 hover:from-red-500 hover:to-amber-400 text-white rounded col-span-2 text-xs font-extrabold"
+                  >
+                    💥 ダイレクトアタック！（決着の一撃！）
+                  </button>
+                  <button
                     onClick={() => toggleTap(selectedCard.card, 'battleZone')}
                     className="py-2 bg-sky-600 hover:bg-sky-500 rounded"
                   >
@@ -2304,6 +3029,18 @@ function BattleRoomContent() {
                     className="py-2 bg-cyan-600 hover:bg-cyan-500 rounded"
                   >
                     ⚡ 能力発動でカード提示
+                  </button>
+                  <button
+                    onClick={() => handleToggleMyIgnore(selectedCard.card)}
+                    className={`py-2 rounded col-span-2 font-extrabold border transition ${
+                      selectedCard.card.ignored
+                        ? 'bg-amber-400 hover:bg-amber-300 text-slate-950 border-yellow-200'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-500'
+                    }`}
+                  >
+                    {selectedCard.card.ignored
+                      ? '☀️ 元の明るさに戻す（行動不能・無視を解除）'
+                      : '🌑 暗くする（攻撃・ブロック不可／無視の目印）'}
                   </button>
                 </>
               )}
@@ -2671,7 +3408,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分の墓地全確認モーダル（観戦時はプレイヤー2の墓地閲覧） ================= */}
+      {/* ================= 自分の墓地全確認モーダル ================= */}
       {graveSearchOpen && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
           <div className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3">
@@ -2755,7 +3492,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 相手（プレイヤー1）の墓地確認モーダル（対戦中・観戦中どちらも閲覧可） ================= */}
+      {/* ================= 相手（プレイヤー1）の墓地確認モーダル ================= */}
       {oppGraveViewOpen && opponent && (
         <div
           onClick={() => setOppGraveViewOpen(false)}
