@@ -51,6 +51,16 @@ type ExtendedRoom = GameRoom & {
   } | null;
 };
 
+interface RoomUpdateMeta {
+  sound?: SoundEventType;
+  cutIn?: {
+    type: CutInEvent['type'];
+    playerName: string;
+    card: BattleCardInstance;
+    subText?: string;
+  };
+}
+
 // public/sounds/ 内のMP3ファイル名マッピング（半角英数字・日本語の両方に自動対応）
 const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
   shieldBreak: ['/sounds/shield.mp3', '/sounds/ガラスが割れる1.mp3', '/sounds/ガラスが割れる1.mp3.mp3'],
@@ -134,7 +144,7 @@ let lastGlobalSoundTime = 0;
 function playGameSound(type: SoundEventType) {
   try {
     const nowMs = Date.now();
-    if (lastGlobalSoundType === type && nowMs - lastGlobalSoundTime < 120) {
+    if (lastGlobalSoundType === type && nowMs - lastGlobalSoundTime < 250) {
       return;
     }
     lastGlobalSoundType = type;
@@ -161,6 +171,27 @@ function playGameSound(type: SoundEventType) {
   } catch (e) {
     console.warn('Sound playback error:', e);
   }
+}
+
+function buildCutInEvent(
+  type: CutInEvent['type'],
+  playerName: string,
+  card: BattleCardInstance,
+  subText?: string
+): CutInEvent {
+  const displayImg =
+    card.kindanRole && card.kindanAwakened && card.kindanAwakenedImageUrl
+      ? card.kindanAwakenedImageUrl
+      : card.imageUrl;
+  return {
+    id: `cutin-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+    type,
+    playerName,
+    cardName: card.name,
+    imageUrl: displayImg,
+    subText,
+    timestamp: Date.now(),
+  };
 }
 
 function createDeckInstances(cards: CardData[]): BattleCardInstance[] {
@@ -278,6 +309,7 @@ function BattleRoomContent() {
   const prevTurnCountRef = useRef<number | null>(null);
   const prevTurnPlayerRef = useRef<string | null>(null);
   const prevSoundEventIdRef = useRef<string | null>(null);
+  const prevCutInIdRef = useRef<string | null>(null);
   const prevPendingDirectIdRef = useRef<string | null>(null);
   const soundEnabledRef = useRef<boolean>(true);
   const notFoundAlertedRef = useRef<boolean>(false);
@@ -332,15 +364,54 @@ function BattleRoomContent() {
 
   const [resetting, setResetting] = useState(false);
 
+  // 1回の操作につき1回だけDB保存し、効果音とカットインも同一更新内で発火させる
   const applyRoomUpdate = useCallback(
-    async (updater: (current: ExtendedRoom) => ExtendedRoom) => {
+    async (updater: (current: ExtendedRoom) => ExtendedRoom, meta?: RoomUpdateMeta) => {
       if (!roomId) return;
       const latest = (await fetchRoomState(roomId)) ?? roomRef.current;
       if (!latest) return;
-      const next = updater(latest);
-      if (next.soundEvent?.id) {
+
+      const now = Date.now();
+      const baseNext = updater(latest);
+      const soundEvent = meta?.sound
+        ? {
+            id: `se-${meta.sound}-${now}-${Math.random().toString(36).substring(2, 6)}`,
+            type: meta.sound,
+            timestamp: now,
+          }
+        : baseNext.soundEvent;
+
+      const cutIn = meta?.cutIn
+        ? {
+            ...buildCutInEvent(
+              meta.cutIn.type,
+              meta.cutIn.playerName,
+              meta.cutIn.card,
+              meta.cutIn.subText
+            ),
+            timestamp: now,
+          }
+        : baseNext.cutIn;
+
+      const next: ExtendedRoom = {
+        ...baseNext,
+        soundEvent,
+        cutIn,
+      };
+
+      if (meta?.sound && soundEnabledRef.current) {
+        if (soundEvent?.id) {
+          prevSoundEventIdRef.current = soundEvent.id;
+        }
+        playGameSound(meta.sound);
+      } else if (next.soundEvent?.id) {
         prevSoundEventIdRef.current = next.soundEvent.id;
       }
+
+      if (cutIn?.id) {
+        prevCutInIdRef.current = cutIn.id;
+      }
+
       roomRef.current = next;
       setRoom(next);
       await saveRoomState(roomId, next);
@@ -348,50 +419,11 @@ function BattleRoomContent() {
     [roomId]
   );
 
-  const broadcastSound = async (type: SoundEventType) => {
-    if (!roomId) return;
-    const id = `${type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    prevSoundEventIdRef.current = id;
-    if (soundEnabledRef.current) {
-      playGameSound(type);
-    }
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      soundEvent: { id, type, timestamp: Date.now() },
-    }));
-  };
-
   const setInspectingStatus = async (text: string | null) => {
     if (!roomId) return;
     await applyRoomUpdate((cur) => ({
       ...cur,
       inspectingText: text,
-    }));
-  };
-
-  const triggerCutIn = async (
-    type: CutInEvent['type'],
-    playerName: string,
-    card: BattleCardInstance,
-    subText?: string
-  ) => {
-    if (!roomId) return;
-    const displayImg =
-      card.kindanRole && card.kindanAwakened && card.kindanAwakenedImageUrl
-        ? card.kindanAwakenedImageUrl
-        : card.imageUrl;
-    const event: CutInEvent = {
-      id: Math.random().toString(36).substring(2, 9),
-      type,
-      playerName,
-      cardName: card.name,
-      imageUrl: displayImg,
-      subText,
-      timestamp: Date.now(),
-    };
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      cutIn: event,
     }));
   };
 
@@ -435,6 +467,10 @@ function BattleRoomContent() {
         }
       } else if (!se && prevSoundEventIdRef.current === null) {
         prevSoundEventIdRef.current = 'init';
+      }
+
+      if (data.cutIn?.id) {
+        prevCutInIdRef.current = data.cutIn.id;
       }
 
       const pda = data.pendingDirectAttack;
@@ -520,7 +556,11 @@ function BattleRoomContent() {
     !!pendingDirectAttack &&
     pendingDirectAttack.attackerPlayerId === myPlayerId;
 
-  const updateMyState = async (newState: Partial<PlayerState>, recordUndo = true) => {
+  const updateMyState = async (
+    newState: Partial<PlayerState>,
+    recordUndo = true,
+    meta?: RoomUpdateMeta
+  ) => {
     if (!me || isSpectator || !myPlayerId) return;
 
     if (recordUndo) {
@@ -548,7 +588,7 @@ function BattleRoomContent() {
           },
         },
       };
-    });
+    }, meta);
   };
 
   const handleToggleMyIgnore = async (targetCard: BattleCardInstance) => {
@@ -669,20 +709,25 @@ function BattleRoomContent() {
       c.instanceId === kindanCard.instanceId ? updatedKindan : c
     );
 
-    await updateMyState({ battleZone: nextBZ });
     setSelectedCard(null);
-
-    if (nextAwakened) {
-      await broadcastSound('kindanRelease');
-      await triggerCutIn(
-        'evolution',
-        me.name,
-        updatedKindan,
-        kindanCard.kindanRole === 'dokindam'
-          ? '🔥 封印解除！禁断解放！！'
-          : '💀 終焉の禁断爆発！！'
-      );
-    }
+    await updateMyState(
+      { battleZone: nextBZ },
+      true,
+      nextAwakened
+        ? {
+            sound: 'kindanRelease',
+            cutIn: {
+              type: 'evolution',
+              playerName: me.name,
+              card: updatedKindan,
+              subText:
+                kindanCard.kindanRole === 'dokindam'
+                  ? '🔥 封印解除！禁断解放！！'
+                  : '💀 終焉の禁断爆発！！',
+            },
+          }
+        : undefined
+    );
   };
 
   const handleUploadKindanImageInRoom = async (
@@ -773,30 +818,33 @@ function BattleRoomContent() {
     };
     nextOppShields.push(faceUpShieldCard);
 
-    await applyRoomUpdate((cur) => {
-      const curPlayers = cur.players || {};
-      const curOpp = curPlayers[topPlayerId] || opponent;
-      return {
-        ...cur,
-        players: {
-          ...curPlayers,
-          [topPlayerId]: {
-            ...curOpp,
-            battleZone: nextOppBZ,
-            mana: nextOppMana,
-            graveyard: nextOppGrave,
-            shields: nextOppShields,
-          },
-        },
-      };
-    });
-
     setInspectCard(null);
-    await triggerCutIn(
-      'ability',
-      me?.name || 'プレイヤー',
-      faceUpShieldCard,
-      `${opponent.name} の新しいシールドとして表向きで追加！`
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curOpp = curPlayers[topPlayerId] || opponent;
+        return {
+          ...cur,
+          players: {
+            ...curPlayers,
+            [topPlayerId]: {
+              ...curOpp,
+              battleZone: nextOppBZ,
+              mana: nextOppMana,
+              graveyard: nextOppGrave,
+              shields: nextOppShields,
+            },
+          },
+        };
+      },
+      {
+        cutIn: {
+          type: 'ability',
+          playerName: me?.name || 'プレイヤー',
+          card: faceUpShieldCard,
+          subText: `${opponent.name} の新しいシールドとして表向きで追加！`,
+        },
+      }
     );
   };
 
@@ -1068,9 +1116,19 @@ function BattleRoomContent() {
       await updateMyState({ hand: [...hand, updatedCard] });
     } else if (dest === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
-      await updateMyState({ battleZone: [...cleanBZ, updatedCard] });
-      await broadcastSound('summon');
-      await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
+      await updateMyState(
+        { battleZone: [...cleanBZ, updatedCard] },
+        true,
+        {
+          sound: 'summon',
+          cutIn: {
+            type: 'summon',
+            playerName: me.name,
+            card: updatedCard,
+            subText: '山札からバトルゾーンへ！',
+          },
+        }
+      );
     } else if (dest === 'mana') {
       await updateMyState({ mana: [...mana, updatedCard] });
     } else if (dest === 'graveyard') {
@@ -1123,7 +1181,8 @@ function BattleRoomContent() {
     fromZone: ZoneType,
     toZone: ZoneType | 'shieldsFaceUp' | 'deckTop' | 'deckBottom',
     skipSound = false,
-    shieldOverlaySlot?: string
+    shieldOverlaySlot?: string,
+    overrideCutIn?: RoomUpdateMeta['cutIn']
   ) => {
     if (!me || isSpectator) return;
 
@@ -1202,37 +1261,52 @@ function BattleRoomContent() {
     if (toZone === 'deckTop') nextDeck.unshift(cleanCard);
     if (toZone === 'deckBottom') nextDeck.push(cleanCard);
 
-    await updateMyState({
-      deck: nextDeck,
-      hand: nextHand,
-      mana: nextMana,
-      shields: nextShields,
-      battleZone: nextBZ,
-      graveyard: nextGrave,
-    });
-    setSelectedCard(null);
+    const originLabel =
+      fromZone === 'mana'
+        ? 'マナゾーンから登場！'
+        : fromZone === 'graveyard'
+        ? '墓地から登場！'
+        : 'バトルゾーンに登場！';
 
-    if (toZone === 'battleZone') {
-      if (!skipSound) {
-        await broadcastSound('summon');
-      }
-      const originLabel =
-        fromZone === 'mana'
-          ? 'マナゾーンから登場！'
-          : fromZone === 'graveyard'
-          ? '墓地から登場！'
-          : 'バトルゾーンに登場！';
-      await triggerCutIn('summon', me.name, cleanCard, originLabel);
-    } else if (toZone === 'shieldsFaceUp') {
-      await triggerCutIn(
-        'ability',
-        me.name,
-        cleanCard,
-        shieldOverlaySlot
-          ? `${shieldOverlaySlot} に表向きシールドとして配置！`
-          : '新しいシールドとして表向きで配置！'
-      );
-    }
+    const meta: RoomUpdateMeta | undefined =
+      toZone === 'battleZone'
+        ? {
+            sound: skipSound ? undefined : 'summon',
+            cutIn: overrideCutIn ?? {
+              type: 'summon',
+              playerName: me.name,
+              card: cleanCard,
+              subText: originLabel,
+            },
+          }
+        : toZone === 'shieldsFaceUp'
+        ? {
+            cutIn: overrideCutIn ?? {
+              type: 'ability',
+              playerName: me.name,
+              card: cleanCard,
+              subText: shieldOverlaySlot
+                ? `${shieldOverlaySlot} に表向きシールドとして配置！`
+                : '新しいシールドとして表向きで配置！',
+            },
+          }
+        : overrideCutIn
+        ? { cutIn: overrideCutIn }
+        : undefined;
+
+    setSelectedCard(null);
+    await updateMyState(
+      {
+        deck: nextDeck,
+        hand: nextHand,
+        mana: nextMana,
+        shields: nextShields,
+        battleZone: nextBZ,
+        graveyard: nextGrave,
+      },
+      true,
+      meta
+    );
   };
 
   const toggleTap = async (card: BattleCardInstance, zone: 'mana' | 'battleZone') => {
@@ -1251,11 +1325,20 @@ function BattleRoomContent() {
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
     );
-    await updateMyState({ battleZone: updatedBZ });
     setSelectedCard(null);
-
-    await broadcastSound('attack');
-    await triggerCutIn('attack', me.name, attacker, 'クリーチャーで攻撃宣言！');
+    await updateMyState(
+      { battleZone: updatedBZ },
+      true,
+      {
+        sound: 'attack',
+        cutIn: {
+          type: 'attack',
+          playerName: me.name,
+          card: attacker,
+          subText: 'クリーチャーで攻撃宣言！',
+        },
+      }
+    );
   };
 
   // ダイレクトアタック宣言（大パンチ.mp3 → 相手が敗北承認で 爆発2.mp3）
@@ -1266,7 +1349,15 @@ function BattleRoomContent() {
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
     );
-    await updateMyState({ battleZone: updatedBZ });
+    const snapshot = JSON.stringify({
+      deck: me.deck || [],
+      hand: me.hand || [],
+      mana: me.mana || [],
+      shields: me.shields || [],
+      battleZone: me.battleZone || [],
+      graveyard: me.graveyard || [],
+    });
+    setUndoStack((prev) => [...prev.slice(-19), snapshot]);
     setDirectAttackModalOpen(false);
     setSelectedCard(null);
 
@@ -1279,16 +1370,31 @@ function BattleRoomContent() {
       timestamp: Date.now(),
     };
 
-    await broadcastSound('attack');
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      pendingDirectAttack: pendingPayload,
-    }));
-    await triggerCutIn(
-      'attack',
-      me.name,
-      attacker,
-      '⚠️ ダイレクトアタック宣言！！相手の対応待ち...'
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          pendingDirectAttack: pendingPayload,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              battleZone: updatedBZ,
+            },
+          },
+        };
+      },
+      {
+        sound: 'attack',
+        cutIn: {
+          type: 'attack',
+          playerName: me.name,
+          card: attacker,
+          subText: '⚠️ ダイレクトアタック宣言！！相手の対応待ち...',
+        },
+      }
     );
   };
 
@@ -1297,16 +1403,20 @@ function BattleRoomContent() {
     if (!pendingDirectAttack || !me) return;
     const { attackerPlayerName, card } = pendingDirectAttack;
 
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      pendingDirectAttack: null,
-    }));
-    await broadcastSound('directAttack');
-    await triggerCutIn(
-      'attack',
-      attackerPlayerName,
-      card,
-      `🏆 決着！！${me.name} が敗北を認めた！（${attackerPlayerName} の勝利！）`
+    await applyRoomUpdate(
+      (cur) => ({
+        ...cur,
+        pendingDirectAttack: null,
+      }),
+      {
+        sound: 'directAttack',
+        cutIn: {
+          type: 'attack',
+          playerName: attackerPlayerName,
+          card,
+          subText: `🏆 決着！！${me.name} が敗北を認めた！（${attackerPlayerName} の勝利！）`,
+        },
+      }
     );
   };
 
@@ -1315,7 +1425,7 @@ function BattleRoomContent() {
     card: BattleCardInstance,
     dest: 'battleZone' | 'graveyard'
   ) => {
-    if (!me || !pendingDirectAttack) return;
+    if (!me || !pendingDirectAttack || !myPlayerId) return;
 
     const nextHand = hand.filter((c) => c.instanceId !== card.instanceId);
     const cleanCard: BattleCardInstance = {
@@ -1327,52 +1437,102 @@ function BattleRoomContent() {
       shieldOverlaySlot: undefined,
     };
 
-    if (dest === 'battleZone') {
-      const cleanBZ = battleZone.filter((c) => c.instanceId !== cleanCard.instanceId);
-      await updateMyState({
-        hand: nextHand,
-        battleZone: [...cleanBZ, cleanCard],
-      });
-    } else {
-      await updateMyState({
-        hand: nextHand,
-        graveyard: [...graveyard, cleanCard],
-      });
-    }
-
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      pendingDirectAttack: null,
-    }));
-    await broadcastSound(dest === 'battleZone' ? 'revZeroTrigger' : 'spell');
-    await triggerCutIn(
-      'trigger',
-      me.name,
-      cleanCard,
+    const nextPlayerPartial: Partial<PlayerState> =
       dest === 'battleZone'
-        ? '🔥 革命0トリガー発動！！バトルゾーンへ降臨！'
-        : '🔥 革命0トリガー呪文発動！！'
+        ? {
+            hand: nextHand,
+            battleZone: [
+              ...battleZone.filter((c) => c.instanceId !== cleanCard.instanceId),
+              cleanCard,
+            ],
+          }
+        : {
+            hand: nextHand,
+            graveyard: [...graveyard, cleanCard],
+          };
+
+    const snapshot = JSON.stringify({
+      deck: me.deck || [],
+      hand: me.hand || [],
+      mana: me.mana || [],
+      shields: me.shields || [],
+      battleZone: me.battleZone || [],
+      graveyard: me.graveyard || [],
+    });
+    setUndoStack((prev) => [...prev.slice(-19), snapshot]);
+
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          pendingDirectAttack: null,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              ...nextPlayerPartial,
+            },
+          },
+        };
+      },
+      {
+        sound: dest === 'battleZone' ? 'revZeroTrigger' : 'spell',
+        cutIn: {
+          type: 'trigger',
+          playerName: me.name,
+          card: cleanCard,
+          subText:
+            dest === 'battleZone'
+              ? '🔥 革命0トリガー発動！！バトルゾーンへ降臨！'
+              : '🔥 革命0トリガー呪文発動！！',
+        },
+      }
     );
   };
 
   const handleBlockDirectAttack = async (blocker: BattleCardInstance) => {
-    if (!me || !pendingDirectAttack) return;
+    if (!me || !pendingDirectAttack || !myPlayerId) return;
 
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === blocker.instanceId ? { ...c, tapped: true } : c
     );
-    await updateMyState({ battleZone: updatedBZ });
+    const snapshot = JSON.stringify({
+      deck: me.deck || [],
+      hand: me.hand || [],
+      mana: me.mana || [],
+      shields: me.shields || [],
+      battleZone: me.battleZone || [],
+      graveyard: me.graveyard || [],
+    });
+    setUndoStack((prev) => [...prev.slice(-19), snapshot]);
 
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      pendingDirectAttack: null,
-    }));
-    await broadcastSound('block');
-    await triggerCutIn(
-      'ability',
-      me.name,
-      blocker,
-      '🛡️ ブロッカー発動！ダイレクトアタックをブロック！！'
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          pendingDirectAttack: null,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              battleZone: updatedBZ,
+            },
+          },
+        };
+      },
+      {
+        sound: 'block',
+        cutIn: {
+          type: 'ability',
+          playerName: me.name,
+          card: blocker,
+          subText: '🛡️ ブロッカー発動！ダイレクトアタックをブロック！！',
+        },
+      }
     );
   };
 
@@ -1392,12 +1552,14 @@ function BattleRoomContent() {
     };
     const nextHand = [...hand, addedToHand];
 
-    await updateMyState({
-      shields: nextShields,
-      hand: nextHand,
-    });
-
-    await broadcastSound('shieldBreak');
+    await updateMyState(
+      {
+        shields: nextShields,
+        hand: nextHand,
+      },
+      true,
+      { sound: 'shieldBreak' }
+    );
     setBrokenShieldCard({ card: addedToHand, slotLabel });
   };
 
@@ -1543,20 +1705,24 @@ function BattleRoomContent() {
       setEvolutionBuilder(null);
       setSelectedCard(null);
 
-      await updateMyState({
-        deck: nextDeck,
-        hand: nextHand,
-        mana: nextMana,
-        graveyard: nextGrave,
-        battleZone: nextBZ,
-      });
-
-      await broadcastSound('summon');
-      await triggerCutIn(
-        'evolution',
-        me.name,
-        evolvedCard,
-        `進化！（下敷き ${selectedMaterials.length}枚：${sourceNames}）`
+      await updateMyState(
+        {
+          deck: nextDeck,
+          hand: nextHand,
+          mana: nextMana,
+          graveyard: nextGrave,
+          battleZone: nextBZ,
+        },
+        true,
+        {
+          sound: 'summon',
+          cutIn: {
+            type: 'evolution',
+            playerName: me.name,
+            card: evolvedCard,
+            subText: `進化！（下敷き ${selectedMaterials.length}枚：${sourceNames}）`,
+          },
+        }
       );
     } finally {
       setIsEvolvingBusy(false);
@@ -1605,22 +1771,26 @@ function BattleRoomContent() {
       .filter((c) => c.instanceId !== incomingCard.instanceId)
       .map((c) => (c.instanceId === targetCard.instanceId ? changedCard : c));
 
-    await updateMyState({
-      hand: nextHand,
-      mana: nextMana,
-      graveyard: nextGrave,
-      battleZone: nextBZ,
-    });
-
     setRevolutionChangePending(null);
     setSelectedCard(null);
 
-    await broadcastSound('summon');
-    await triggerCutIn(
-      'evolution',
-      me.name,
-      changedCard,
-      `革命チェンジ！（『${targetCard.name}』は手札へ）`
+    await updateMyState(
+      {
+        hand: nextHand,
+        mana: nextMana,
+        graveyard: nextGrave,
+        battleZone: nextBZ,
+      },
+      true,
+      {
+        sound: 'summon',
+        cutIn: {
+          type: 'evolution',
+          playerName: me.name,
+          card: changedCard,
+          subText: `革命チェンジ！（『${targetCard.name}』は手札へ）`,
+        },
+      }
     );
   };
 
@@ -1672,9 +1842,19 @@ function BattleRoomContent() {
       await updateMyState({ deck: nextDeck, hand: [...hand, updatedCard] });
     } else if (toZone === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
-      await updateMyState({ deck: nextDeck, battleZone: [...cleanBZ, updatedCard] });
-      await broadcastSound('summon');
-      await triggerCutIn('summon', me.name, updatedCard, '山札からバトルゾーンへ！');
+      await updateMyState(
+        { deck: nextDeck, battleZone: [...cleanBZ, updatedCard] },
+        true,
+        {
+          sound: 'summon',
+          cutIn: {
+            type: 'summon',
+            playerName: me.name,
+            card: updatedCard,
+            subText: '山札からバトルゾーンへ！',
+          },
+        }
+      );
     } else if (toZone === 'mana') {
       await updateMyState({ deck: nextDeck, mana: [...mana, updatedCard] });
     } else if (toZone === 'graveyard') {
@@ -2651,10 +2831,12 @@ function BattleRoomContent() {
                   onClick={async () => {
                     const c = brokenShieldCard.card;
                     setBrokenShieldCard(null);
-                    await moveCard(c, 'hand', 'battleZone');
-                    if (me) {
-                      await triggerCutIn('trigger', me.name, c, 'S・トリガーでバトルゾーンへ！');
-                    }
+                    await moveCard(c, 'hand', 'battleZone', false, undefined, {
+                      type: 'trigger',
+                      playerName: me?.name || '自分',
+                      card: c,
+                      subText: 'S・トリガーでバトルゾーンへ！',
+                    });
                   }}
                   className="py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl"
                 >
@@ -2664,10 +2846,14 @@ function BattleRoomContent() {
                   onClick={async () => {
                     const c = brokenShieldCard.card;
                     setBrokenShieldCard(null);
-                    await moveCard(c, 'hand', 'graveyard', true);
-                    await broadcastSound('spell');
-                    if (me) {
-                      await triggerCutIn('trigger', me.name, c, 'S・トリガー呪文を詠唱！');
+                    await moveCard(c, 'hand', 'graveyard', true, undefined, {
+                      type: 'trigger',
+                      playerName: me?.name || '自分',
+                      card: c,
+                      subText: 'S・トリガー呪文を詠唱！',
+                    });
+                    if (soundEnabledRef.current) {
+                      playGameSound('spell');
                     }
                   }}
                   className="py-2.5 bg-sky-500 hover:bg-sky-400 text-slate-950 rounded-xl"
@@ -3112,10 +3298,14 @@ function BattleRoomContent() {
                   <button
                     onClick={async () => {
                       const c = selectedCard.card;
-                      await moveCard(c, 'hand', 'graveyard', true);
-                      await broadcastSound('spell');
-                      if (me) {
-                        await triggerCutIn('ability', me.name, c, '呪文を詠唱！');
+                      await moveCard(c, 'hand', 'graveyard', true, undefined, {
+                        type: 'ability',
+                        playerName: me?.name || '自分',
+                        card: c,
+                        subText: '呪文を詠唱！',
+                      });
+                      if (soundEnabledRef.current) {
+                        playGameSound('spell');
                       }
                     }}
                     className="py-2 bg-sky-600 hover:bg-sky-500 rounded col-span-2"
@@ -3193,7 +3383,17 @@ function BattleRoomContent() {
                       const c = selectedCard.card;
                       setSelectedCard(null);
                       if (me) {
-                        await triggerCutIn('ability', me.name, c, '能力発動！');
+                        await applyRoomUpdate(
+                          (cur) => cur,
+                          {
+                            cutIn: {
+                              type: 'ability',
+                              playerName: me.name,
+                              card: c,
+                              subText: '能力発動！',
+                            },
+                          }
+                        );
                       }
                     }}
                     className="py-2 bg-cyan-600 hover:bg-cyan-500 rounded"
