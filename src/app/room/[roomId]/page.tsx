@@ -40,8 +40,20 @@ interface PendingDirectAttack {
   timestamp: number;
 }
 
+interface ActiveAttackTarget {
+  id: string;
+  attackerPlayerId: string;
+  attackerPlayerName: string;
+  attackerCardName: string;
+  defenderPlayerId: string;
+  shieldIds: string[];
+  creatureId?: string | null;
+  timestamp: number;
+}
+
 type ExtendedRoom = GameRoom & {
   pendingDirectAttack?: PendingDirectAttack | null;
+  attackTarget?: ActiveAttackTarget | null;
   soundEvent?: { id: string; type: SoundEventType; timestamp: number } | null;
   inspectingText?: string | null;
   cutIn?: CutInEvent | null;
@@ -305,6 +317,11 @@ function BattleRoomContent() {
   const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
 
+  // 攻撃先指定モード用state
+  const [targetingAttacker, setTargetingAttacker] = useState<BattleCardInstance | null>(null);
+  const [selectedTargetShieldIds, setSelectedTargetShieldIds] = useState<string[]>([]);
+  const [selectedTargetCreatureId, setSelectedTargetCreatureId] = useState<string | null>(null);
+
   const roomRef = useRef<ExtendedRoom | null>(null);
   const isUpdatingRef = useRef<boolean>(false);
   const lastUpdateAtRef = useRef<number>(0);
@@ -558,6 +575,7 @@ function BattleRoomContent() {
   const isMyTurn = !isSpectator && room.turnPlayerId === myPlayerId;
 
   const pendingDirectAttack = room.pendingDirectAttack || null;
+  const activeAttackTarget = room.attackTarget || null;
   const amIDefendingDirectAttack =
     !isSpectator &&
     !!pendingDirectAttack &&
@@ -566,6 +584,39 @@ function BattleRoomContent() {
     !isSpectator &&
     !!pendingDirectAttack &&
     pendingDirectAttack.attackerPlayerId === myPlayerId;
+
+  const isTargetOfAttack = (cardInstanceId: string, zone: 'shields' | 'battleZone'): boolean => {
+    if (!activeAttackTarget) return false;
+    if (zone === 'shields') {
+      return activeAttackTarget.shieldIds?.includes(cardInstanceId) || false;
+    }
+    return activeAttackTarget.creatureId === cardInstanceId;
+  };
+
+  const openAttackTargeting = (attacker: BattleCardInstance) => {
+    setSelectedCard(null);
+    setTargetingAttacker(attacker);
+    setSelectedTargetShieldIds([]);
+    setSelectedTargetCreatureId(null);
+  };
+
+  const cancelAttackTargeting = () => {
+    setTargetingAttacker(null);
+    setSelectedTargetShieldIds([]);
+    setSelectedTargetCreatureId(null);
+  };
+
+  const toggleTargetShield = (shieldId: string) => {
+    setSelectedTargetCreatureId(null);
+    setSelectedTargetShieldIds((prev) =>
+      prev.includes(shieldId) ? prev.filter((id) => id !== shieldId) : [...prev, shieldId]
+    );
+  };
+
+  const toggleTargetCreature = (creatureId: string) => {
+    setSelectedTargetShieldIds([]);
+    setSelectedTargetCreatureId((prev) => (prev === creatureId ? null : creatureId));
+  };
 
   const updateMyState = async (
     newState: Partial<PlayerState>,
@@ -868,6 +919,7 @@ function BattleRoomContent() {
     setSelectedCard(null);
     setBrokenShieldCard(null);
     setEvolutionBuilder(null);
+    cancelAttackTargeting();
     await applyRoomUpdate((cur) => {
       const curPlayers = cur.players || {};
       const curMe = curPlayers[myPlayerId] || me;
@@ -876,6 +928,7 @@ function BattleRoomContent() {
         inspectingText: null,
         publicReveal: null,
         pendingDirectAttack: null,
+        attackTarget: null,
         players: {
           ...curPlayers,
           [myPlayerId]: {
@@ -986,6 +1039,7 @@ function BattleRoomContent() {
         cutIn: null,
         publicReveal: null,
         pendingDirectAttack: null,
+        attackTarget: null,
       }));
 
       setUndoStack([]);
@@ -993,6 +1047,7 @@ function BattleRoomContent() {
       setSelectedCard(null);
       setBrokenShieldCard(null);
       setEvolutionBuilder(null);
+      cancelAttackTargeting();
     } catch (error) {
       console.error(error);
       alert('試合のリセットに失敗しました');
@@ -1077,11 +1132,13 @@ function BattleRoomContent() {
   const handleTurnEnd = async () => {
     if (isSpectator) return;
     if (!topPlayerId) return alert('対戦相手がまだいません');
+    cancelAttackTargeting();
     await applyRoomUpdate((cur) => ({
       ...cur,
       turnPlayerId: topPlayerId,
       turnCount: (cur.turnCount || 1) + 1,
       pendingDirectAttack: null,
+      attackTarget: null,
     }));
   };
 
@@ -1330,23 +1387,88 @@ function BattleRoomContent() {
     setSelectedCard(null);
   };
 
-  // シンプルな攻撃宣言（大パンチ.mp3）
-  const handleAttackDeclare = async (attacker: BattleCardInstance) => {
-    if (!me || isSpectator) return;
+  // 攻撃宣言（攻撃先指定あり／なし両対応・大パンチ.mp3）
+  const handleAttackDeclare = async (
+    attacker: BattleCardInstance,
+    targetOverride?: { shieldIds: string[]; creatureId: string | null }
+  ) => {
+    if (!me || isSpectator || !myPlayerId) return;
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
     );
+
+    const shieldIds = targetOverride?.shieldIds || [];
+    const creatureId = targetOverride?.creatureId || null;
+    const hasTarget = shieldIds.length > 0 || !!creatureId;
+
+    const targetCreature = creatureId
+      ? oppBattleZone.find((c) => c.instanceId === creatureId)
+      : undefined;
+
+    const shieldLabels = shieldIds
+      .map((sid) => {
+        const idx = oppShields.findIndex((s) => s.instanceId === sid);
+        if (idx === -1) return null;
+        return oppShields[idx].shieldOverlaySlot || `S${idx + 1}`;
+      })
+      .filter(Boolean);
+
+    const targetSummary = targetCreature
+      ? `相手クリーチャー「${targetCreature.name}」を攻撃！`
+      : shieldLabels.length > 0
+      ? `相手シールド（${shieldLabels.join('・')}）を攻撃！`
+      : 'クリーチャーで攻撃宣言！';
+
+    const nextAttackTarget: ActiveAttackTarget | null =
+      hasTarget && topPlayerId
+        ? {
+            id: `atk-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            attackerPlayerId: myPlayerId,
+            attackerPlayerName: me.name,
+            attackerCardName: attacker.name,
+            defenderPlayerId: topPlayerId,
+            shieldIds,
+            creatureId,
+            timestamp: Date.now(),
+          }
+        : null;
+
     setSelectedCard(null);
-    await updateMyState(
-      { battleZone: updatedBZ },
-      true,
+    cancelAttackTargeting();
+
+    const snapshot = JSON.stringify({
+      deck: me.deck || [],
+      hand: me.hand || [],
+      mana: me.mana || [],
+      shields: me.shields || [],
+      battleZone: me.battleZone || [],
+      graveyard: me.graveyard || [],
+    });
+    setUndoStack((prev) => [...prev.slice(-19), snapshot]);
+
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          attackTarget: nextAttackTarget,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              battleZone: updatedBZ,
+            },
+          },
+        };
+      },
       {
         sound: 'attack',
         cutIn: {
           type: 'attack',
           playerName: me.name,
           card: attacker,
-          subText: 'クリーチャーで攻撃宣言！',
+          subText: targetSummary,
         },
       }
     );
@@ -1371,6 +1493,7 @@ function BattleRoomContent() {
     setUndoStack((prev) => [...prev.slice(-19), snapshot]);
     setDirectAttackModalOpen(false);
     setSelectedCard(null);
+    cancelAttackTargeting();
 
     const pendingPayload: PendingDirectAttack = {
       id: `da-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -1388,6 +1511,7 @@ function BattleRoomContent() {
         return {
           ...cur,
           pendingDirectAttack: pendingPayload,
+          attackTarget: null,
           players: {
             ...curPlayers,
             [myPlayerId]: {
@@ -1418,6 +1542,7 @@ function BattleRoomContent() {
       (cur) => ({
         ...cur,
         pendingDirectAttack: null,
+        attackTarget: null,
       }),
       {
         sound: 'directAttack',
@@ -1891,6 +2016,21 @@ function BattleRoomContent() {
     const isKindan = !!card.kindanRole;
     const isIgnored = zone === 'battleZone' && !!card.ignored;
 
+    const isOpponentZone = !isControllable && !isSpectator;
+    const isPickedInTargetingMode =
+      !isSpectator &&
+      !!targetingAttacker &&
+      isOpponentZone &&
+      (zone === 'shields'
+        ? selectedTargetShieldIds.includes(card.instanceId)
+        : zone === 'battleZone' && selectedTargetCreatureId === card.instanceId);
+
+    const isHighlightedByRemoteAttack =
+      (zone === 'shields' || zone === 'battleZone') &&
+      isTargetOfAttack(card.instanceId, zone);
+
+    const isGlowingTarget = isPickedInTargetingMode || isHighlightedByRemoteAttack;
+
     const kindanDisplayImage = isKindan
       ? card.kindanAwakened
         ? card.kindanAwakenedImageUrl || card.imageUrl
@@ -1906,6 +2046,17 @@ function BattleRoomContent() {
         key={card.instanceId}
         onClick={() => {
           if (!isControllable) {
+            if (!isSpectator && targetingAttacker) {
+              if (zone === 'shields') {
+                toggleTargetShield(card.instanceId);
+                return;
+              }
+              if (zone === 'battleZone') {
+                toggleTargetCreature(card.instanceId);
+                return;
+              }
+            }
+
             if (showFace) {
               setInspectCard({
                 card,
@@ -1947,18 +2098,30 @@ function BattleRoomContent() {
           setSelectedCard({ card, zone, shieldSlotIndex: zone === 'shields' ? index : undefined });
         }}
         title={
-          zone === 'shields' && !card.faceUp
+          !isSpectator && targetingAttacker && isOpponentZone && (zone === 'shields' || zone === 'battleZone')
+            ? `${slotName}（タップで攻撃対象に指定/解除）`
+            : zone === 'shields' && !card.faceUp
             ? `${slotName}（タップでブレイク）`
             : showFace
             ? `${card.name}（タップで操作・拡大）`
             : '裏向きカード'
         }
         className={`relative select-none transition-all shrink-0 ${
-          canClick ? 'cursor-pointer active:scale-95' : 'cursor-default'
+          canClick || (!isSpectator && targetingAttacker && isOpponentZone && (zone === 'shields' || zone === 'battleZone'))
+            ? 'cursor-pointer active:scale-95'
+            : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
           isIgnored ? 'brightness-50 saturate-50' : ''
-        } ${underCount > 0 ? 'mt-2 ml-1.5' : ''}`}
+        } ${isGlowingTarget ? 'ring-4 ring-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.95)] scale-105 z-10 animate-pulse rounded-md' : ''} ${
+          underCount > 0 ? 'mt-2 ml-1.5' : ''
+        }`}
       >
+        {isGlowingTarget && (
+          <span className=" -top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-rose-600 text-white border border-yellow-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
+            🎯 攻撃対象
+          </span>
+        )}
+
         {underCount > 0 && (
           <div
             className={`absolute -top-2 -left-1.5 w-full h-full rounded-md border shadow-sm pointer-events-none ${
@@ -2116,6 +2279,18 @@ function BattleRoomContent() {
     (_, i) => `S${i + 1}`
   );
 
+  const selectedShieldLabelsForBar = selectedTargetShieldIds
+    .map((sid) => {
+      const idx = oppShields.findIndex((s) => s.instanceId === sid);
+      if (idx === -1) return null;
+      return oppShields[idx].shieldOverlaySlot || `S${idx + 1}`;
+    })
+    .filter(Boolean);
+
+  const selectedCreatureForBar = selectedTargetCreatureId
+    ? oppBattleZone.find((c) => c.instanceId === selectedTargetCreatureId)
+    : undefined;
+
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-2 sm:p-4 max-w-6xl mx-auto">
       <CutInOverlay event={room.cutIn} />
@@ -2244,6 +2419,67 @@ function BattleRoomContent() {
           </button>
         </div>
       </header>
+
+      {/* 攻撃先指定モード中の操作バー */}
+      {!isSpectator && targetingAttacker && (
+        <div className="my-1.5 p-2.5 bg-rose-950/95 border-2 border-rose-400 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold shadow-xl">
+          <div className="space-y-0.5">
+            <div className="text-amber-300 font-extrabold">
+              🎯 「{targetingAttacker.name}」の攻撃先を選択中（相手のシールド複数タップ または 相手クリーチャーをタップ）
+            </div>
+            <div className="text-rose-200 text-[11px]">
+              選択中：
+              {selectedCreatureForBar
+                ? `相手クリーチャー「${selectedCreatureForBar.name}」`
+                : selectedShieldLabelsForBar.length > 0
+                ? `シールド ${selectedShieldLabelsForBar.join('・')}`
+                : '未選択（このまま攻撃宣言も可）'}
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() =>
+                handleAttackDeclare(targetingAttacker, {
+                  shieldIds: selectedTargetShieldIds,
+                  creatureId: selectedTargetCreatureId,
+                })
+              }
+              className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white border border-yellow-300 rounded-lg text-xs font-extrabold shadow"
+            >
+              ⚔️ この攻撃先で攻撃宣言！
+            </button>
+            <button
+              type="button"
+              onClick={cancelAttackTargeting}
+              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold"
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 相手から狙われている側への通知バナー */}
+      {!isSpectator && activeAttackTarget && activeAttackTarget.defenderPlayerId === myPlayerId && (
+        <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-rose-500 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-rose-100 animate-pulse">
+          <span>
+            🎯 {activeAttackTarget.attackerPlayerName} の「{activeAttackTarget.attackerCardName}」が光っている対象を狙っています！
+          </span>
+          <button
+            type="button"
+            onClick={async () => {
+              await applyRoomUpdate((cur) => ({
+                ...cur,
+                attackTarget: null,
+              }));
+            }}
+            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] shrink-0 text-slate-200"
+          >
+            表示を消す
+          </button>
+        </div>
+      )}
 
       {/* ダイレクトアタック宣言送信後の待機バナー（攻撃側） */}
       {amIWaitingDirectAttack && pendingDirectAttack && (
@@ -3372,10 +3608,16 @@ function BattleRoomContent() {
               {selectedCard.zone === 'battleZone' && (
                 <>
                   <button
-                    onClick={() => handleAttackDeclare(selectedCard.card)}
-                    className="py-2.5 bg-rose-600 hover:bg-rose-500 rounded col-span-2 text-sm"
+                    onClick={() => openAttackTargeting(selectedCard.card)}
+                    className="py-2.5 bg-rose-600 hover:bg-rose-500 rounded col-span-2 text-sm border border-yellow-300/60"
                   >
-                    🔥 攻撃する（タップ＆カード提示）
+                    🎯 攻撃先を指定して攻撃（盾・相手キャラ）
+                  </button>
+                  <button
+                    onClick={() => handleAttackDeclare(selectedCard.card)}
+                    className="py-2 bg-rose-800 hover:bg-rose-700 rounded col-span-2 text-xs"
+                  >
+                    🔥 そのまま攻撃宣言（タップ＆カード提示）
                   </button>
                   <button
                     onClick={() => handleDeclareDirectAttack(selectedCard.card)}
