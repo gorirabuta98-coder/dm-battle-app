@@ -26,6 +26,12 @@ type BattleCardInstance = CardInstance & {
   shieldOverlaySlot?: string;
 };
 
+interface ShieldSlotData {
+  slot: string;
+  baseCard: BattleCardInstance | null;
+  faceUpOverlays: BattleCardInstance[];
+}
+
 interface SelectedEvolutionMaterial {
   card: BattleCardInstance;
   sourceZone: EvolutionSourceZone;
@@ -217,6 +223,16 @@ function buildCutInEvent(
   };
 }
 
+function assignInitialShieldSlots(cards: BattleCardInstance[]): BattleCardInstance[] {
+  return cards.map((c, idx) => ({
+    ...c,
+    faceUp: false,
+    tapped: false,
+    ignored: false,
+    shieldOverlaySlot: c.shieldOverlaySlot || `S${idx + 1}`,
+  }));
+}
+
 function createDeckInstances(cards: CardData[]): BattleCardInstance[] {
   const instances: BattleCardInstance[] = cards.map((card, index) => ({
     ...card,
@@ -283,6 +299,77 @@ function createKindanCard(
   return null;
 }
 
+// シールド配列を S1, S2, S3, S4, S5... のスロット構造に変換
+function buildShieldSlots(shieldList: BattleCardInstance[]): ShieldSlotData[] {
+  const slotMap = new Map<string, ShieldSlotData>();
+
+  const ensureSlot = (slotName: string): ShieldSlotData => {
+    if (!slotMap.has(slotName)) {
+      slotMap.set(slotName, {
+        slot: slotName,
+        baseCard: null,
+        faceUpOverlays: [],
+      });
+    }
+    return slotMap.get(slotName)!;
+  };
+
+  for (let i = 1; i <= 5; i++) {
+    ensureSlot(`S${i}`);
+  }
+
+  const unassignedBase: BattleCardInstance[] = [];
+  const unassignedOverlays: BattleCardInstance[] = [];
+
+  shieldList.forEach((c) => {
+    const rawSlot = c.shieldOverlaySlot;
+    if (rawSlot && /^S\d+$/.test(rawSlot)) {
+      const entry = ensureSlot(rawSlot);
+      if (c.faceUp) {
+        entry.faceUpOverlays.push(c);
+      } else if (!entry.baseCard) {
+        entry.baseCard = c;
+      } else {
+        unassignedBase.push(c);
+      }
+    } else if (c.faceUp) {
+      unassignedOverlays.push(c);
+    } else {
+      unassignedBase.push(c);
+    }
+  });
+
+  unassignedBase.forEach((c) => {
+    const emptySlot = Array.from(slotMap.values()).find((s) => !s.baseCard);
+    if (emptySlot) {
+      emptySlot.baseCard = { ...c, shieldOverlaySlot: emptySlot.slot };
+    } else {
+      const nextNum = slotMap.size + 1;
+      const created = ensureSlot(`S${nextNum}`);
+      created.baseCard = { ...c, shieldOverlaySlot: created.slot };
+    }
+  });
+
+  unassignedOverlays.forEach((c) => {
+    const targetSlot =
+      Array.from(slotMap.values()).find((s) => !!s.baseCard) || ensureSlot('S1');
+    targetSlot.faceUpOverlays.push({ ...c, shieldOverlaySlot: targetSlot.slot });
+  });
+
+  return Array.from(slotMap.values()).sort((a, b) => {
+    const numA = parseInt(a.slot.replace(/^S/, ''), 10) || 0;
+    const numB = parseInt(b.slot.replace(/^S/, ''), 10) || 0;
+    return numA - numB;
+  });
+}
+
+function getNextEmptyOrNewSlot(shieldList: BattleCardInstance[]): string {
+  const slots = buildShieldSlots(shieldList);
+  const emptyExisting = slots.find((s) => !s.baseCard && s.faceUpOverlays.length === 0);
+  if (emptyExisting) return emptyExisting.slot;
+  return `S${slots.length + 1}`;
+}
+
 async function fetchRoomState(targetRoomId: string): Promise<ExtendedRoom | null> {
   const { data, error } = await supabase
     .from('rooms')
@@ -331,6 +418,14 @@ function BattleRoomContent() {
 
   // ターン切り替わり視覚バナー
   const [turnBanner, setTurnBanner] = useState<TurnBannerState | null>(null);
+
+  // シールドスロットタップ時の確認・ブレイクモーダル（裏盾＋重なり表盾を一覧表示）
+  const [inspectedShieldSlot, setInspectedShieldSlot] = useState<{
+    slot: string;
+    isMine: boolean;
+    ownerName: string;
+    cards: BattleCardInstance[];
+  } | null>(null);
 
   // シールド複数同時選択・チェックモード
   const [multiShieldSelectMode, setMultiShieldSelectMode] = useState<boolean>(false);
@@ -439,10 +534,14 @@ function BattleRoomContent() {
   }, [turnBanner]);
 
   const applyRoomUpdate = useCallback(
-    async (updater: (current: ExtendedRoom) => ExtendedRoom, meta?: RoomUpdateMeta) => {
+    async (
+      updater: (current: ExtendedRoom) => ExtendedRoom,
+      meta?: RoomUpdateMeta,
+      force = false
+    ) => {
       if (!roomId) return;
       const now = Date.now();
-      if (isUpdatingRef.current || now - lastUpdateAtRef.current < 350) {
+      if (!force && (isUpdatingRef.current || now - lastUpdateAtRef.current < 350)) {
         return;
       }
 
@@ -501,12 +600,16 @@ function BattleRoomContent() {
     [roomId]
   );
 
-  const setInspectingStatus = async (text: string | null) => {
+  const setInspectingStatus = async (text: string | null, force = false) => {
     if (!roomId) return;
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      inspectingText: text,
-    }));
+    await applyRoomUpdate(
+      (cur) => ({
+        ...cur,
+        inspectingText: text,
+      }),
+      undefined,
+      force
+    );
   };
 
   useEffect(() => {
@@ -695,7 +798,8 @@ function BattleRoomContent() {
   const updateMyState = async (
     newState: Partial<PlayerState>,
     recordUndo = true,
-    meta?: RoomUpdateMeta
+    meta?: RoomUpdateMeta,
+    force = false
   ) => {
     if (!me || isSpectator || !myPlayerId) return;
 
@@ -711,20 +815,24 @@ function BattleRoomContent() {
       setUndoStack((prev) => [...prev.slice(-19), snapshot]);
     }
 
-    await applyRoomUpdate((cur) => {
-      const curPlayers = cur.players || {};
-      const curMe = curPlayers[myPlayerId] || me;
-      return {
-        ...cur,
-        players: {
-          ...curPlayers,
-          [myPlayerId]: {
-            ...curMe,
-            ...newState,
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              ...newState,
+            },
           },
-        },
-      };
-    }, meta);
+        };
+      },
+      meta,
+      force
+    );
   };
 
   // 選択した複数シールドをまとめてチェック（表向きにして確認キューへ）
@@ -736,7 +844,7 @@ function BattleRoomContent() {
     setShieldCheckQueue(picked);
   };
 
-  // 選択した複数シールドをまとめてブレイク
+  // 選択した複数シールドをまとめてブレイク（スロット位置は空いて保持される）
   const handleBreakSelectedShields = async () => {
     if (!me || isSpectator || selectedShieldIds.length === 0) return;
     const idSet = new Set(selectedShieldIds);
@@ -1024,12 +1132,14 @@ function BattleRoomContent() {
       nextOppGrave.push(...freedUnder);
     }
 
+    const targetSlot = getNextEmptyOrNewSlot(nextOppShields);
     const faceUpShieldCard: BattleCardInstance = {
       ...targetCard,
       tapped: false,
       faceUp: true,
       underCards: [],
       ignored: false,
+      shieldOverlaySlot: targetSlot,
     };
     nextOppShields.push(faceUpShieldCard);
 
@@ -1057,7 +1167,7 @@ function BattleRoomContent() {
           type: 'ability',
           playerName: me?.name || 'プレイヤー',
           card: faceUpShieldCard,
-          subText: `${opponent.name} の新しいシールドとして表向きで追加！`,
+          subText: `${opponent.name} の ${targetSlot} に表向きシールドとして追加！`,
         },
       }
     );
@@ -1073,28 +1183,33 @@ function BattleRoomContent() {
     setSelectedGraveCard(null);
     setBrokenShieldCard(null);
     setEvolutionBuilder(null);
+    setInspectedShieldSlot(null);
     setSelectedShieldIds([]);
     setShieldCheckQueue([]);
     cancelAttackTargeting();
-    await applyRoomUpdate((cur) => {
-      const curPlayers = cur.players || {};
-      const curMe = curPlayers[myPlayerId] || me;
-      return {
-        ...cur,
-        inspectingText: null,
-        publicReveal: null,
-        publicHandReveal: null,
-        pendingDirectAttack: null,
-        attackTarget: null,
-        players: {
-          ...curPlayers,
-          [myPlayerId]: {
-            ...curMe,
-            ...restored,
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          inspectingText: null,
+          publicReveal: null,
+          publicHandReveal: null,
+          pendingDirectAttack: null,
+          attackTarget: null,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              ...restored,
+            },
           },
-        },
-      };
-    });
+        };
+      },
+      undefined,
+      true
+    );
   };
 
   const handleResetMatch = async () => {
@@ -1147,7 +1262,7 @@ function BattleRoomContent() {
         }
 
         const shuffled = createDeckInstances(baseCards);
-        const shields = shuffled.slice(0, 5).map((c) => ({ ...c, faceUp: false }));
+        const shields = assignInitialShieldSlots(shuffled.slice(0, 5));
         const hand = shuffled.slice(5, 10).map((c) => ({ ...c, faceUp: true }));
 
         const kType: KindanType = p.kindanType || 'none';
@@ -1187,18 +1302,22 @@ function BattleRoomContent() {
       }
 
       const firstPlayerId = playerIds[0] || myPlayerId;
-      await applyRoomUpdate((cur) => ({
-        ...cur,
-        players: updatedPlayers,
-        turnPlayerId: firstPlayerId,
-        turnCount: 1,
-        inspectingText: null,
-        cutIn: null,
-        publicReveal: null,
-        publicHandReveal: null,
-        pendingDirectAttack: null,
-        attackTarget: null,
-      }));
+      await applyRoomUpdate(
+        (cur) => ({
+          ...cur,
+          players: updatedPlayers,
+          turnPlayerId: firstPlayerId,
+          turnCount: 1,
+          inspectingText: null,
+          cutIn: null,
+          publicReveal: null,
+          publicHandReveal: null,
+          pendingDirectAttack: null,
+          attackTarget: null,
+        }),
+        undefined,
+        true
+      );
 
       setUndoStack([]);
       setPeekState(null);
@@ -1206,6 +1325,7 @@ function BattleRoomContent() {
       setSelectedGraveCard(null);
       setBrokenShieldCard(null);
       setEvolutionBuilder(null);
+      setInspectedShieldSlot(null);
       setSelectedShieldIds([]);
       setShieldCheckQueue([]);
       cancelAttackTargeting();
@@ -1231,6 +1351,11 @@ function BattleRoomContent() {
   const oppBattleZone = (opponent?.battleZone || []) as BattleCardInstance[];
   const oppGraveyard = (opponent?.graveyard || []) as BattleCardInstance[];
 
+  const myShieldSlots = buildShieldSlots(shields);
+  const oppShieldSlots = buildShieldSlots(oppShields);
+  const myActiveShieldCount = shields.length;
+  const oppActiveShieldCount = oppShields.length;
+
   const normalBattleZone = battleZone.filter((c) => !c.kindanRole);
   const kindanBattleZone = battleZone.find((c) => c.kindanRole);
 
@@ -1245,12 +1370,13 @@ function BattleRoomContent() {
     if (!me || isSpectator || deck.length === 0) return alert('山札がありません');
     const newDeck = [...deck];
     const topCard = newDeck.shift()!;
+    const assignedSlot = dest === 'shields' ? getNextEmptyOrNewSlot(shields) : undefined;
     const updatedCard: BattleCardInstance = {
       ...topCard,
       tapped: false,
       faceUp: dest !== 'shields',
       ignored: false,
-      shieldOverlaySlot: undefined,
+      shieldOverlaySlot: assignedSlot,
     };
 
     if (dest === 'hand') {
@@ -1307,13 +1433,17 @@ function BattleRoomContent() {
       attackTarget: null,
     };
     triggerTurnBanner(nextTurnState);
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      turnPlayerId: topPlayerId,
-      turnCount: nextTurnCount,
-      pendingDirectAttack: null,
-      attackTarget: null,
-    }));
+    await applyRoomUpdate(
+      (cur) => ({
+        ...cur,
+        turnPlayerId: topPlayerId,
+        turnCount: nextTurnCount,
+        pendingDirectAttack: null,
+        attackTarget: null,
+      }),
+      undefined,
+      true
+    );
   };
 
   const handlePeekTopDeck = async (count: number, isPublic: boolean) => {
@@ -1322,19 +1452,26 @@ function BattleRoomContent() {
     const newDeck = [...deck];
     const revealed = newDeck.splice(0, actualCount).map((c) => ({ ...c, faceUp: true }));
 
-    await updateMyState({ deck: newDeck });
+    await updateMyState({ deck: newDeck }, true, undefined, true);
 
     if (isPublic) {
-      await applyRoomUpdate((cur) => ({
-        ...cur,
-        inspectingText: `${me.name} が山札の上から ${actualCount} 枚を公開中！`,
-        publicReveal: {
-          playerName: me.name,
-          cards: revealed,
-        },
-      }));
+      await applyRoomUpdate(
+        (cur) => ({
+          ...cur,
+          inspectingText: `${me.name} が山札の上から ${actualCount} 枚を公開中！`,
+          publicReveal: {
+            playerName: me.name,
+            cards: revealed,
+          },
+        }),
+        undefined,
+        true
+      );
     } else {
-      await setInspectingStatus(`${me.name} が山札の上から ${actualCount} 枚を非公開で確認中...`);
+      await setInspectingStatus(
+        `${me.name} が山札の上から ${actualCount} 枚を非公開で確認中...`,
+        true
+      );
     }
 
     setPeekState({ cards: revealed, isPublic });
@@ -1354,64 +1491,114 @@ function BattleRoomContent() {
       shieldOverlaySlot: undefined,
     };
 
-    if (dest === 'hand') {
-      await updateMyState({ hand: [...hand, updatedCard] });
-    } else if (dest === 'battleZone') {
-      const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
-      await updateMyState({ battleZone: [...cleanBZ, updatedCard] }, true, {
-        sound: 'summon',
-        cutIn: {
-          type: 'summon',
-          playerName: me.name,
-          card: updatedCard,
-          subText: '山札からバトルゾーンへ！',
-        },
-      });
-    } else if (dest === 'mana') {
-      await updateMyState({ mana: [...mana, updatedCard] });
-    } else if (dest === 'graveyard') {
-      await updateMyState({ graveyard: [...graveyard, updatedCard] });
-    }
+    const nextPlayerState: Partial<PlayerState> =
+      dest === 'hand'
+        ? { hand: [...hand, updatedCard] }
+        : dest === 'battleZone'
+        ? {
+            battleZone: [
+              ...battleZone.filter((c) => c.instanceId !== updatedCard.instanceId),
+              updatedCard,
+            ],
+          }
+        : dest === 'mana'
+        ? { mana: [...mana, updatedCard] }
+        : { graveyard: [...graveyard, updatedCard] };
+
+    const meta: RoomUpdateMeta | undefined =
+      dest === 'battleZone'
+        ? {
+            sound: 'summon',
+            cutIn: {
+              type: 'summon',
+              playerName: me.name,
+              card: updatedCard,
+              subText: '山札からバトルゾーンへ！',
+            },
+          }
+        : undefined;
 
     if (remaining.length === 0) {
       setPeekState(null);
-      await applyRoomUpdate((cur) => ({
-        ...cur,
-        inspectingText: null,
-        publicReveal: null,
-      }));
+      await applyRoomUpdate(
+        (cur) => {
+          const curPlayers = cur.players || {};
+          const curMe = curPlayers[myPlayerId] || me;
+          return {
+            ...cur,
+            inspectingText: null,
+            publicReveal: null,
+            players: {
+              ...curPlayers,
+              [myPlayerId]: {
+                ...curMe,
+                ...nextPlayerState,
+              },
+            },
+          };
+        },
+        meta,
+        true
+      );
     } else {
+      await updateMyState(nextPlayerState, true, meta, true);
       setPeekState({ ...peekState, cards: remaining });
       if (peekState.isPublic) {
-        await applyRoomUpdate((cur) => ({
-          ...cur,
-          publicReveal: {
-            playerName: me.name,
-            cards: remaining,
-          },
-        }));
+        await applyRoomUpdate(
+          (cur) => ({
+            ...cur,
+            publicReveal: {
+              playerName: me.name,
+              cards: remaining,
+            },
+          }),
+          undefined,
+          true
+        );
       }
     }
   };
 
   const handleFinishPeek = async (destination: 'bottom' | 'top' | 'graveyard') => {
-    if (!peekState || isSpectator) return;
-    if (destination === 'bottom') {
-      const hidden = peekState.cards.map((c) => ({ ...c, faceUp: false }));
-      await updateMyState({ deck: [...deck, ...hidden] }, false);
-    } else if (destination === 'top') {
-      const hidden = peekState.cards.map((c) => ({ ...c, faceUp: false }));
-      await updateMyState({ deck: [...hidden, ...deck] }, false);
-    } else {
-      const toGrave = peekState.cards.map((c) => ({ ...c, faceUp: true, tapped: false }));
-      await updateMyState({ graveyard: [...graveyard, ...toGrave] }, false);
-    }
+    if (!peekState || !me || isSpectator) return;
+
+    const nextDeckPartial: Partial<PlayerState> =
+      destination === 'bottom'
+        ? {
+            deck: [...deck, ...peekState.cards.map((c) => ({ ...c, faceUp: false }))],
+          }
+        : destination === 'top'
+        ? {
+            deck: [...peekState.cards.map((c) => ({ ...c, faceUp: false })), ...deck],
+          }
+        : {
+            graveyard: [
+              ...graveyard,
+              ...peekState.cards.map((c) => ({ ...c, faceUp: true, tapped: false })),
+            ],
+          };
+
     setPeekState(null);
-    await applyRoomUpdate((cur) => ({
-      ...cur,
-      inspectingText: null,
-      publicReveal: null,
-    }));
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          inspectingText: null,
+          publicReveal: null,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              ...nextDeckPartial,
+            },
+          },
+        };
+      },
+      undefined,
+      true
+    );
   };
 
   const moveCard = async (
@@ -1471,6 +1658,13 @@ function BattleRoomContent() {
     const isFaceUpDest =
       toZone !== 'shields' && toZone !== 'deckTop' && toZone !== 'deckBottom';
 
+    const resolvedSlot =
+      toZone === 'shieldsFaceUp'
+        ? shieldOverlaySlot || card.shieldOverlaySlot || 'S1'
+        : toZone === 'shields'
+        ? getNextEmptyOrNewSlot(nextShields)
+        : undefined;
+
     const cleanCard: BattleCardInstance = {
       ...card,
       tapped: false,
@@ -1481,7 +1675,7 @@ function BattleRoomContent() {
         ? card.underCards || []
         : [],
       ignored: false,
-      shieldOverlaySlot: toZone === 'shieldsFaceUp' ? shieldOverlaySlot : undefined,
+      shieldOverlaySlot: resolvedSlot,
     };
 
     if (toZone === 'hand') nextHand.push(cleanCard);
@@ -1519,8 +1713,8 @@ function BattleRoomContent() {
               type: 'ability',
               playerName: me.name,
               card: cleanCard,
-              subText: shieldOverlaySlot
-                ? `${shieldOverlaySlot} に表向きシールドとして配置！`
+              subText: resolvedSlot
+                ? `${resolvedSlot} の上に表向きシールドとして配置！`
                 : '新しいシールドとして表向きで配置！',
             },
           }
@@ -1530,6 +1724,7 @@ function BattleRoomContent() {
 
     setSelectedCard(null);
     setSelectedGraveCard(null);
+    setInspectedShieldSlot(null);
     await updateMyState(
       {
         deck: nextDeck,
@@ -1573,9 +1768,8 @@ function BattleRoomContent() {
 
     const shieldLabels = shieldIds
       .map((sid) => {
-        const idx = oppShields.findIndex((s) => s.instanceId === sid);
-        if (idx === -1) return null;
-        return oppShields[idx].shieldOverlaySlot || `S${idx + 1}`;
+        const found = oppShields.find((s) => s.instanceId === sid);
+        return found?.shieldOverlaySlot || null;
       })
       .filter(Boolean);
 
@@ -1881,10 +2075,9 @@ function BattleRoomContent() {
     );
   };
 
-  const handleBreakShield = async (card: BattleCardInstance, slotIndex?: number) => {
+  const handleBreakShield = async (card: BattleCardInstance, slotLabel?: string) => {
     if (!me || isSpectator) return;
-    const slotLabel =
-      card.shieldOverlaySlot || (slotIndex !== undefined ? `S${slotIndex + 1}` : undefined);
+    const resolvedLabel = slotLabel || card.shieldOverlaySlot;
     const nextShields = shields.filter((c) => c.instanceId !== card.instanceId);
     const addedToHand: BattleCardInstance = {
       ...card,
@@ -1896,6 +2089,7 @@ function BattleRoomContent() {
     };
     const nextHand = [...hand, addedToHand];
 
+    setInspectedShieldSlot(null);
     await updateMyState(
       {
         shields: nextShields,
@@ -1904,7 +2098,7 @@ function BattleRoomContent() {
       true,
       { sound: 'shieldBreak' }
     );
-    setBrokenShieldCard({ card: addedToHand, slotLabel });
+    setBrokenShieldCard({ card: addedToHand, slotLabel: resolvedLabel });
   };
 
   const toggleEvolutionMaterial = (card: BattleCardInstance, sourceZone: EvolutionSourceZone) => {
@@ -2172,12 +2366,13 @@ function BattleRoomContent() {
   ) => {
     if (!me || isSpectator) return;
     const nextDeck = deck.filter((c) => c.instanceId !== card.instanceId);
+    const assignedSlot = toZone === 'shields' ? getNextEmptyOrNewSlot(shields) : undefined;
     const updatedCard: BattleCardInstance = {
       ...card,
       tapped: false,
       faceUp: toZone !== 'shields',
       ignored: false,
-      shieldOverlaySlot: undefined,
+      shieldOverlaySlot: assignedSlot,
     };
 
     if (toZone === 'hand') {
@@ -2218,21 +2413,16 @@ function BattleRoomContent() {
     const isKindan = !!card.kindanRole;
     const isIgnored = zone === 'battleZone' && !!card.ignored;
 
-    const isMyMultiSelectedShield =
-      isControllable && zone === 'shields' && selectedShieldIds.includes(card.instanceId);
-
     const isOpponentZone = !isControllable && !isSpectator;
     const isPickedInTargetingMode =
       !isSpectator &&
       !!targetingAttacker &&
       isOpponentZone &&
-      (zone === 'shields'
-        ? selectedTargetShieldIds.includes(card.instanceId)
-        : zone === 'battleZone' && selectedTargetCreatureId === card.instanceId);
+      zone === 'battleZone' &&
+      selectedTargetCreatureId === card.instanceId;
 
     const isHighlightedByRemoteAttack =
-      (zone === 'shields' || zone === 'battleZone') &&
-      isTargetOfAttack(card.instanceId, zone);
+      zone === 'battleZone' && isTargetOfAttack(card.instanceId, 'battleZone');
 
     const isGlowingTarget = isPickedInTargetingMode || isHighlightedByRemoteAttack;
 
@@ -2243,23 +2433,15 @@ function BattleRoomContent() {
       : card.imageUrl;
 
     const slotName = `S${(index ?? 0) + 1}`;
-    const shieldBadgeLabel =
-      card.shieldOverlaySlot || (zone === 'shields' && index !== undefined ? slotName : '🛡️表盾');
 
     return (
       <div
         key={card.instanceId}
         onClick={() => {
           if (!isControllable) {
-            if (!isSpectator && targetingAttacker) {
-              if (zone === 'shields') {
-                toggleTargetShield(card.instanceId);
-                return;
-              }
-              if (zone === 'battleZone') {
-                toggleTargetCreature(card.instanceId);
-                return;
-              }
+            if (!isSpectator && targetingAttacker && zone === 'battleZone') {
+              toggleTargetCreature(card.instanceId);
+              return;
             }
 
             if (showFace) {
@@ -2273,19 +2455,6 @@ function BattleRoomContent() {
             return;
           }
 
-          if (zone === 'shields' && multiShieldSelectMode) {
-            toggleMultiShieldId(card.instanceId);
-            return;
-          }
-
-          if (zone === 'shields' && !card.faceUp) {
-            handleBreakShield(card, index);
-            return;
-          }
-          if (zone === 'shields' && card.faceUp) {
-            setSelectedCard({ card, zone: 'shields', shieldSlotIndex: index });
-            return;
-          }
           if (zone === 'mana') {
             toggleTap(card, 'mana');
             return;
@@ -2305,28 +2474,17 @@ function BattleRoomContent() {
             }
             return;
           }
-          setSelectedCard({ card, zone, shieldSlotIndex: zone === 'shields' ? index : undefined });
+          setSelectedCard({ card, zone });
         }}
         title={
-          !isSpectator &&
-          targetingAttacker &&
-          isOpponentZone &&
-          (zone === 'shields' || zone === 'battleZone')
-            ? `${slotName}（タップで攻撃対象に指定/解除）`
-            : zone === 'shields' && multiShieldSelectMode
-            ? `${slotName}（タップで複数選択/解除）`
-            : zone === 'shields' && !card.faceUp
-            ? `${slotName}（タップでブレイク）`
+          !isSpectator && targetingAttacker && isOpponentZone && zone === 'battleZone'
+            ? `${card.name}（タップで攻撃対象に指定/解除）`
             : showFace
             ? `${card.name}（タップで操作・拡大）`
             : '裏向きカード'
         }
         className={`relative select-none transition-all shrink-0 ${
-          canClick ||
-          (!isSpectator &&
-            targetingAttacker &&
-            isOpponentZone &&
-            (zone === 'shields' || zone === 'battleZone'))
+          canClick || (!isSpectator && targetingAttacker && isOpponentZone && zone === 'battleZone')
             ? 'cursor-pointer active:scale-95'
             : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
@@ -2334,20 +2492,12 @@ function BattleRoomContent() {
         } ${
           isGlowingTarget
             ? 'ring-4 ring-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.95)] scale-105 z-10 animate-pulse rounded-md'
-            : isMyMultiSelectedShield
-            ? 'ring-4 ring-sky-400 shadow-[0_0_16px_rgba(56,189,248,0.9)] -translate-y-1 z-10 rounded-md'
             : ''
         } ${underCount > 0 ? 'mt-2 ml-1.5' : ''}`}
       >
         {isGlowingTarget && (
           <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-rose-600 text-white border border-yellow-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
             🎯 攻撃対象
-          </span>
-        )}
-
-        {isMyMultiSelectedShield && (
-          <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-sky-500 text-slate-950 border border-white text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
-            ✓ 選択中
           </span>
         )}
 
@@ -2371,11 +2521,7 @@ function BattleRoomContent() {
                 } text-white`
               : showFace
               ? `w-14 h-20 sm:w-16 sm:h-24 bg-slate-800 ${
-                  zone === 'shields'
-                    ? 'border-2 border-amber-400 ring-2 ring-amber-400/50'
-                    : isIgnored
-                    ? 'border border-slate-600'
-                    : 'border border-slate-400'
+                  isIgnored ? 'border border-slate-600' : 'border border-slate-400'
                 } text-white`
               : 'w-12 h-16 sm:w-14 sm:h-20 bg-indigo-950 border-2 border-amber-500/70 text-amber-300 items-center justify-center'
           }`}
@@ -2430,11 +2576,6 @@ function BattleRoomContent() {
                   alt={card.name}
                   className="w-full h-full object-cover"
                 />
-                {zone === 'shields' && (
-                  <span className="absolute top-0.5 left-0.5 bg-amber-400 text-slate-950 text-[8px] font-extrabold px-1 rounded shadow">
-                    {shieldBadgeLabel}
-                  </span>
-                )}
                 {card.isShieldTrigger && (
                   <span className="absolute top-0.5 right-0.5 bg-yellow-400 text-slate-950 text-[8px] font-extrabold px-1 rounded shadow">
                     ⚡ST
@@ -2453,11 +2594,6 @@ function BattleRoomContent() {
               </>
             ) : (
               <div className="p-1 flex flex-col justify-center items-center h-full">
-                {zone === 'shields' && (
-                  <span className="mb-0.5 bg-amber-400 text-slate-950 text-[8px] font-extrabold px-1 rounded">
-                    {shieldBadgeLabel}
-                  </span>
-                )}
                 <div className="text-[9px] font-bold leading-tight line-clamp-3 text-center">
                   {card.name}
                 </div>
@@ -2469,14 +2605,169 @@ function BattleRoomContent() {
               </div>
             )
           ) : (
-            <span className="text-xs font-bold">
-              {zone === 'shields' ? slotName : 'DM'}
-            </span>
+            <span className="text-xs font-bold">{slotName}</span>
           )}
         </div>
       </div>
     );
   };
+
+  // スロット（S1〜S5＋重なり表向きシールド）を描画するヘルパー
+  const renderShieldSlotsRow = (slots: ShieldSlotData[], isMine: boolean, ownerName: string) => (
+    <div className="flex flex-wrap gap-2 items-end min-h-[78px] pt-2">
+      {slots.map((slotData) => {
+        const { slot, baseCard, faceUpOverlays } = slotData;
+        const allCardsInSlot: BattleCardInstance[] = [
+          ...(baseCard ? [baseCard] : []),
+          ...faceUpOverlays,
+        ];
+        const isEmptySlot = allCardsInSlot.length === 0;
+        const topOverlay =
+          faceUpOverlays.length > 0 ? faceUpOverlays[faceUpOverlays.length - 1] : null;
+
+        const isAnyCardSelectedForMulti =
+          isMine && allCardsInSlot.some((c) => selectedShieldIds.includes(c.instanceId));
+
+        const isAnyCardTargeted =
+          !isMine &&
+          !isSpectator &&
+          ((!!targetingAttacker &&
+            allCardsInSlot.some((c) => selectedTargetShieldIds.includes(c.instanceId))) ||
+            allCardsInSlot.some((c) => isTargetOfAttack(c.instanceId, 'shields')));
+
+        const handleSlotClick = () => {
+          if (isEmptySlot) return;
+
+          if (!isMine) {
+            if (!isSpectator && targetingAttacker) {
+              const targetCard = topOverlay || baseCard;
+              if (targetCard) {
+                toggleTargetShield(targetCard.instanceId);
+              }
+              return;
+            }
+
+            if (topOverlay) {
+              setInspectCard({
+                card: topOverlay,
+                ownerName,
+                sourceZone: 'shields',
+                isOpponentCard: !isSpectator,
+              });
+            } else if (baseCard && baseCard.faceUp) {
+              setInspectCard({
+                card: baseCard,
+                ownerName,
+                sourceZone: 'shields',
+                isOpponentCard: !isSpectator,
+              });
+            }
+            return;
+          }
+
+          if (multiShieldSelectMode) {
+            const primaryCard = topOverlay || baseCard;
+            if (primaryCard) {
+              toggleMultiShieldId(primaryCard.instanceId);
+            }
+            return;
+          }
+
+          // 自分シールド1回タップ：いきなりブレイクせず、重なり確認＆ブレイク選択モーダルを開く
+          setInspectedShieldSlot({
+            slot,
+            isMine: true,
+            ownerName,
+            cards: allCardsInSlot,
+          });
+        };
+
+        return (
+          <div
+            key={slot}
+            onClick={handleSlotClick}
+            title={
+              isEmptySlot
+                ? `${slot}（空き枠）`
+                : isMine
+                ? `${slot}（タップでシールド確認・ブレイク選択／重なり ${allCardsInSlot.length}枚）`
+                : `${slot}（タップで確認）`
+            }
+            className={`relative select-none transition-all shrink-0 ${
+              isEmptySlot ? 'cursor-default opacity-45' : 'cursor-pointer active:scale-95'
+            } ${
+              isAnyCardTargeted
+                ? 'ring-4 ring-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.95)] scale-105 z-10 animate-pulse rounded-md'
+                : isAnyCardSelectedForMulti
+                ? 'ring-4 ring-sky-400 shadow-[0_0_16px_rgba(56,189,248,0.9)] -translate-y-1 z-10 rounded-md'
+                : ''
+            }`}
+          >
+            {isAnyCardTargeted && (
+              <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-rose-600 text-white border border-yellow-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-30 pointer-events-none">
+                🎯 攻撃対象
+              </span>
+            )}
+
+            {isAnyCardSelectedForMulti && (
+              <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-sky-500 text-slate-950 border border-white text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-30 pointer-events-none">
+                ✓ 選択中
+              </span>
+            )}
+
+            <div className="relative w-12 h-16 sm:w-14 sm:h-20">
+              {/* ベースの裏盾（または空き枠） */}
+              {baseCard ? (
+                <div className="w-full h-full rounded-md bg-indigo-950 border-2 border-amber-500/80 text-amber-300 flex flex-col items-center justify-center shadow-md">
+                  <span className="text-xs font-extrabold">{slot}</span>
+                  <span className="text-[8px] text-amber-200/80">裏盾</span>
+                </div>
+              ) : (
+                <div className="w-full h-full rounded-md border border-dashed border-slate-700 bg-slate-900/40 text-slate-600 flex flex-col items-center justify-center">
+                  <span className="text-[10px] font-bold">{slot}</span>
+                  <span className="text-[8px]">空き</span>
+                </div>
+              )}
+
+              {/* スロットの上に重なっている表向きシールド（複数重なりも段差表示） */}
+              {faceUpOverlays.map((ov, ovIdx) => (
+                <div
+                  key={ov.instanceId}
+                  style={{
+                    top: `${-6 - ovIdx * 4}px`,
+                    left: `${4 + ovIdx * 4}px`,
+                  }}
+                  className="absolute w-full h-full rounded-md overflow-hidden border-2 border-amber-300 bg-slate-800 shadow-xl z-10"
+                >
+                  {ov.imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={ov.imageUrl}
+                      alt={ov.name}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-[8px] font-bold text-center p-0.5 text-amber-200">
+                      {ov.name}
+                    </div>
+                  )}
+                  <span className="absolute bottom-0 inset-x-0 bg-amber-400 text-slate-950 text-[8px] font-extrabold text-center py-0.5">
+                    {slot} 表{faceUpOverlays.length > 1 ? `(${faceUpOverlays.length})` : ''}
+                  </span>
+                </div>
+              ))}
+
+              {allCardsInSlot.length > 1 && (
+                <span className="-top-2 -right-2 absolute bg-purple-600 text-white border border-white text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow z-20">
+                  {allCardsInSlot.length}枚重なり
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 
   // 墓地ゾーンの「一番最新のカードだけ上に表示＋タップで横並び一覧を開く」ウィジェット
   const renderGraveyardStackWidget = (
@@ -2547,16 +2838,12 @@ function BattleRoomContent() {
     return deck.filter((c) => c.instanceId !== excludeId);
   };
 
-  const shieldSlotChoices = Array.from(
-    { length: Math.max(shields.length, 5) },
-    (_, i) => `S${i + 1}`
-  );
+  const shieldSlotChoices = myShieldSlots.map((s) => s.slot);
 
   const selectedShieldLabelsForBar = selectedTargetShieldIds
     .map((sid) => {
-      const idx = oppShields.findIndex((s) => s.instanceId === sid);
-      if (idx === -1) return null;
-      return oppShields[idx].shieldOverlaySlot || `S${idx + 1}`;
+      const found = oppShields.find((s) => s.instanceId === sid);
+      return found?.shieldOverlaySlot || null;
     })
     .filter(Boolean);
 
@@ -2570,7 +2857,7 @@ function BattleRoomContent() {
 
       {/* ターン切り替わり視覚バナー */}
       {turnBanner && (
-        <div className="fixed inset-x-0 top-16 flex justify-center z-50 pointer-events-none px-4">
+        <div className="fixed inset-x-0 top-20 flex justify-center z-50 pointer-events-none px-4">
           <div
             className={`px-6 py-3 rounded-2xl border-2 shadow-2xl text-center backdrop-blur-md transition-all animate-bounce ${
               turnBanner.isMyTurn
@@ -2590,8 +2877,8 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* 上部バー */}
-      <header className="flex flex-wrap items-center justify-between gap-2 bg-slate-900 p-2.5 rounded-lg border border-slate-800">
+      {/* 上部バー（スクロール時も固定） */}
+      <header className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-2 bg-slate-900/95 backdrop-blur-md p-2.5 rounded-lg border border-slate-700 shadow-lg">
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <span className="text-xs sm:text-sm bg-slate-800 px-2.5 py-1 rounded font-mono font-bold text-amber-400">
             ID: {room.roomId}
@@ -2951,15 +3238,13 @@ function BattleRoomContent() {
           {oppMana.map((c) => renderCard(c, 'mana', false, opponent?.name || '相手'))}
         </div>
 
-        {/* 相手シールドゾーン ＋ 隣に相手墓地（最新1枚表示・タップで横並び一覧） */}
+        {/* 相手シールドゾーン ＋ 隣に相手墓地 */}
         <div className="flex items-stretch justify-between gap-2 bg-slate-950/50 p-1.5 rounded">
-          <div className="flex flex-wrap gap-1.5 min-h-[40px] items-center flex-1">
-            <span className="text-[10px] text-slate-500 mr-1">
-              シールド ({oppShields.length}枚):
+          <div className="flex flex-col justify-between gap-1 min-h-[56px] flex-1">
+            <span className="text-[10px] text-slate-500">
+              シールド ({oppActiveShieldCount}枚):
             </span>
-            {oppShields.map((c, idx) =>
-              renderCard(c, 'shields', false, opponent?.name || '相手', idx)
-            )}
+            {renderShieldSlotsRow(oppShieldSlots, false, opponent?.name || '相手')}
           </div>
           {opponent &&
             renderGraveyardStackWidget(
@@ -3019,16 +3304,16 @@ function BattleRoomContent() {
           )}
         </div>
 
-        {/* 自分シールドゾーン ＋ 隣に自分墓地（最新1枚表示・タップで横並び一覧） */}
+        {/* 自分シールドゾーン ＋ 隣に自分墓地 */}
         <div className="flex flex-col sm:flex-row items-stretch justify-between gap-2 bg-slate-950/60 p-2 rounded">
           <div className="flex-1 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-[10px] text-amber-400 font-bold">
-                シールド ({shields.length}枚)
+                シールド ({myActiveShieldCount}枚)
                 {!isSpectator &&
                   (multiShieldSelectMode
                     ? ' ※複数選択中（タップでON/OFF）'
-                    : ' ※S1〜S5タップでブレイク／表盾タップで拡大')}
+                    : ' ※S1〜S5タップで確認・ブレイク選択')}
               </span>
               {!isSpectator && shields.length > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -3071,11 +3356,7 @@ function BattleRoomContent() {
               )}
             </div>
 
-            <div className="flex flex-wrap gap-1.5 items-center min-h-[48px]">
-              {shields.map((c, idx) =>
-                renderCard(c, 'shields', !isSpectator, me?.name || '自分', idx)
-              )}
-            </div>
+            {renderShieldSlotsRow(myShieldSlots, !isSpectator, me?.name || '自分')}
 
             {!isSpectator && (
               <div className="flex flex-wrap gap-1.5 items-center pt-1">
@@ -3197,6 +3478,109 @@ function BattleRoomContent() {
           </div>
         </div>
       </section>
+
+      {/* ================= シールドスロットタップ時の「確認・ブレイク選択」モーダル ================= */}
+      {!isSpectator && inspectedShieldSlot && (
+        <div
+          onClick={() => setInspectedShieldSlot(null)}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-amber-400 rounded-2xl p-4 max-w-2xl w-full max-h-[90vh] flex flex-col space-y-3 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-extrabold text-sm sm:text-base text-amber-300">
+                  🛡️ {inspectedShieldSlot.slot} のシールド確認（重なり {inspectedShieldSlot.cards.length}枚）
+                </h3>
+                <p className="text-[11px] text-slate-300">
+                  シールドブレイクしますか？ブレイクするカードを選ぶと手札に加わります
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setInspectedShieldSlot(null)}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
+              >
+                閉じる
+              </button>
+            </div>
+
+            <div className="overflow-x-auto flex gap-3 py-2 items-center">
+              {inspectedShieldSlot.cards.map((c, idx) => {
+                const isBaseHidden = !c.faceUp;
+                const layerLabel = isBaseHidden ? '裏盾' : `表盾 ${idx + 1}`;
+                return (
+                  <div
+                    key={c.instanceId}
+                    className="bg-slate-800 border border-amber-400/60 rounded-xl p-2.5 flex flex-col items-center w-32 sm:w-36 shrink-0 space-y-2"
+                  >
+                    <span className="px-2 py-0.5 bg-amber-500/20 border border-amber-400 text-amber-200 rounded text-[10px] font-extrabold">
+                      {layerLabel}
+                    </span>
+
+                    {c.faceUp && c.imageUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={c.imageUrl}
+                        alt={c.name}
+                        onClick={() =>
+                          setInspectCard({
+                            card: c,
+                            ownerName: inspectedShieldSlot.ownerName,
+                          })
+                        }
+                        className="cursor-pointer w-24 h-34 object-cover rounded border border-slate-600 hover:scale-105 transition"
+                      />
+                    ) : (
+                      <div className="w-24 h-34 rounded-lg bg-indigo-950 border-2 border-amber-500/70 text-amber-300 flex flex-col items-center justify-center text-xs font-extrabold">
+                        <span>{inspectedShieldSlot.slot}</span>
+                        <span className="text-[10px] mt-1">裏向きシールド</span>
+                      </div>
+                    )}
+
+                    <div className="text-[11px] font-bold truncate w-full text-center">
+                      {c.faceUp ? c.name : `${inspectedShieldSlot.slot}（裏向き）`}
+                    </div>
+
+                    {c.faceUp && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInspectCard({
+                            card: c,
+                            ownerName: inspectedShieldSlot.ownerName,
+                          })
+                        }
+                        className="w-full py-1 bg-slate-700 hover:bg-slate-600 rounded text-[10px] font-bold text-sky-300"
+                      >
+                        🔍 拡大して見る
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleBreakShield(c, inspectedShieldSlot.slot)}
+                      className="w-full py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-extrabold shadow"
+                    >
+                      💥 シールドブレイクする
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setInspectedShieldSlot(null)}
+              className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs font-bold"
+            >
+              ブレイクせずに閉じる
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ================= シールド複数同時チェックモーダル ================= */}
       {shieldCheckQueue.length > 0 && (
@@ -3885,14 +4269,18 @@ function BattleRoomContent() {
                 <button
                   onClick={async () => {
                     setPeekState({ ...peekState, isPublic: true });
-                    await applyRoomUpdate((cur) => ({
-                      ...cur,
-                      inspectingText: `${me.name} が山札の上から ${peekState.cards.length} 枚を公開中！`,
-                      publicReveal: {
-                        playerName: me.name,
-                        cards: peekState.cards,
-                      },
-                    }));
+                    await applyRoomUpdate(
+                      (cur) => ({
+                        ...cur,
+                        inspectingText: `${me.name} が山札の上から ${peekState.cards.length} 枚を公開中！`,
+                        publicReveal: {
+                          playerName: me.name,
+                          cards: peekState.cards,
+                        },
+                      }),
+                      undefined,
+                      true
+                    );
                   }}
                   className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded-lg text-xs font-extrabold"
                 >
@@ -4114,9 +4502,8 @@ function BattleRoomContent() {
                 <button
                   onClick={() => {
                     const c = selectedCard.card;
-                    const idx = selectedCard.shieldSlotIndex;
                     setSelectedCard(null);
-                    handleBreakShield(c, idx);
+                    handleBreakShield(c);
                   }}
                   className="py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded col-span-2 text-sm font-extrabold"
                 >
@@ -4391,7 +4778,7 @@ function BattleRoomContent() {
 
                 <div className="bg-amber-950/50 border border-amber-500/40 rounded-lg p-2 space-y-1.5">
                   <div className="text-[10px] font-bold text-amber-300 text-center">
-                    🛡️ 表向きシールドとして乗せる（どの盾の上かS1〜S5表記）
+                    🛡️ 表向きシールドとして乗せる（どのシールドの上に乗せるか選択）
                   </div>
                   <div className="grid grid-cols-5 gap-1 text-[11px] font-extrabold">
                     {shieldSlotChoices.map((slot) => (
@@ -4668,7 +5055,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分の墓地（手札・マナ風横並びカード表示＋タップで移動ボタン） ================= */}
+      {/* ================= 自分の墓地（手札・マナ風横並び＋タップで即拡大＆移動ボタン） ================= */}
       {graveSearchOpen && (
         <div
           onClick={() => {
@@ -4679,7 +5066,7 @@ function BattleRoomContent() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="bg-slate-900 border-2 border-rose-500/70 rounded-2xl p-4 max-w-3xl w-full max-h-[88vh] flex flex-col space-y-3 shadow-2xl"
+            className="bg-slate-900 border-2 border-rose-500/70 rounded-2xl p-4 max-w-3xl w-full max-h-[90vh] overflow-y-auto flex flex-col space-y-3 shadow-2xl"
           >
             <div className="flex justify-between items-center">
               <div>
@@ -4687,7 +5074,7 @@ function BattleRoomContent() {
                   {me?.name || '自分'}の墓地 ({graveyard.length}枚)
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  カードをタップすると、山札やマナなどへ送るボタンが表示されます
+                  カードをタップすると大きく拡大表示され、山札やマナなどへ送るボタンが出ます
                 </p>
               </div>
               <button
@@ -4704,7 +5091,7 @@ function BattleRoomContent() {
             {graveyard.length === 0 ? (
               <p className="text-xs text-slate-400 py-8 text-center">墓地にカードはありません</p>
             ) : (
-              <div className="overflow-x-auto flex gap-2.5 py-2 items-center min-h-[120px]">
+              <div className="overflow-x-auto flex gap-2.5 py-2 items-center min-h-[116px]">
                 {graveyard.map((c) => {
                   const isPicked = selectedGraveCard?.instanceId === c.instanceId;
                   return (
@@ -4743,75 +5130,89 @@ function BattleRoomContent() {
             )}
 
             {!isSpectator && selectedGraveCard && (
-              <div className="bg-slate-950 border border-amber-400/60 rounded-xl p-3 space-y-2">
-                <div className="flex items-center justify-between text-xs font-extrabold text-amber-300">
-                  <span>選択中：「{selectedGraveCard.name}」の移動先</span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setInspectCard({
-                        card: selectedGraveCard,
-                        ownerName: me?.name || '自分',
-                      })
-                    }
-                    className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-[11px] text-sky-300"
-                  >
-                    🔍 拡大表示
-                  </button>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs font-bold">
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'hand')}
-                    className="py-2 bg-sky-600 hover:bg-sky-500 rounded-lg"
-                  >
-                    手札へ
-                  </button>
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'battleZone')}
-                    className="py-2 bg-amber-600 hover:bg-amber-500 rounded-lg"
-                  >
-                    場に出す
-                  </button>
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'mana')}
-                    className="py-2 bg-lime-700 hover:bg-lime-600 rounded-lg"
-                  >
-                    マナへ
-                  </button>
-                  <button
-                    onClick={() => {
-                      const target = selectedGraveCard;
-                      setGraveSearchOpen(false);
-                      setSelectedGraveCard(null);
-                      setEvolutionBuilder({
-                        evolvingCard: target,
-                        fromZone: 'graveyard',
-                        activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'graveyard',
-                        selectedMaterials: [],
-                      });
-                    }}
-                    className="py-2 bg-purple-600 hover:bg-purple-500 rounded-lg"
-                  >
-                    🧬 進化
-                  </button>
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'shields')}
-                    className="py-2 bg-amber-800 hover:bg-amber-700 rounded-lg"
-                  >
-                    シールドへ(裏)
-                  </button>
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckTop')}
-                    className="py-2 bg-indigo-700 hover:bg-indigo-600 rounded-lg"
-                  >
-                    山札の上へ
-                  </button>
-                  <button
-                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckBottom')}
-                    className="py-2 bg-indigo-900 hover:bg-indigo-800 rounded-lg col-span-2"
-                  >
-                    山札の下へ
-                  </button>
+              <div className="bg-slate-950 border border-amber-400/60 rounded-xl p-3 space-y-3">
+                <div className="flex flex-col sm:flex-row items-center gap-3">
+                  {selectedGraveCard.imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={selectedGraveCard.imageUrl}
+                      alt={selectedGraveCard.name}
+                      onClick={() =>
+                        setInspectCard({
+                          card: selectedGraveCard,
+                          ownerName: me?.name || '自分',
+                        })
+                      }
+                      className="cursor-pointer w-36 h-52 sm:w-44 sm:h-64 object-contain rounded-xl border-2 border-amber-400/80 bg-slate-900 shadow-xl shrink-0"
+                    />
+                  ) : (
+                    <div className="w-36 h-52 bg-slate-800 rounded-xl flex items-center justify-center text-xs font-bold text-center p-2 shrink-0">
+                      {selectedGraveCard.name}
+                    </div>
+                  )}
+
+                  <div className="flex-1 w-full space-y-2">
+                    <div className="text-xs sm:text-sm font-extrabold text-amber-300">
+                      選択中：「{selectedGraveCard.name}」
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      タップで大きく表示中。移動先ボタンを押すとそのゾーンへ送ります。
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 text-xs font-bold">
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'hand')}
+                        className="py-2 bg-sky-600 hover:bg-sky-500 rounded-lg"
+                      >
+                        手札へ
+                      </button>
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'battleZone')}
+                        className="py-2 bg-amber-600 hover:bg-amber-500 rounded-lg"
+                      >
+                        場に出す
+                      </button>
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'mana')}
+                        className="py-2 bg-lime-700 hover:bg-lime-600 rounded-lg"
+                      >
+                        マナへ
+                      </button>
+                      <button
+                        onClick={() => {
+                          const target = selectedGraveCard;
+                          setGraveSearchOpen(false);
+                          setSelectedGraveCard(null);
+                          setEvolutionBuilder({
+                            evolvingCard: target,
+                            fromZone: 'graveyard',
+                            activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'graveyard',
+                            selectedMaterials: [],
+                          });
+                        }}
+                        className="py-2 bg-purple-600 hover:bg-purple-500 rounded-lg"
+                      >
+                        🧬 進化
+                      </button>
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'shields')}
+                        className="py-2 bg-amber-800 hover:bg-amber-700 rounded-lg"
+                      >
+                        シールドへ(裏)
+                      </button>
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckTop')}
+                        className="py-2 bg-indigo-700 hover:bg-indigo-600 rounded-lg"
+                      >
+                        山札の上へ
+                      </button>
+                      <button
+                        onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckBottom')}
+                        className="py-2 bg-indigo-900 hover:bg-indigo-800 rounded-lg col-span-2 sm:col-span-3"
+                      >
+                        山札の下へ
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
