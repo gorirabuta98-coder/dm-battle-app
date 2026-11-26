@@ -51,6 +51,19 @@ interface ActiveAttackTarget {
   timestamp: number;
 }
 
+interface PublicHandReveal {
+  playerId: string;
+  playerName: string;
+  cards: BattleCardInstance[];
+}
+
+interface TurnBannerState {
+  id: string;
+  turnCount: number;
+  turnPlayerName: string;
+  isMyTurn: boolean;
+}
+
 type ExtendedRoom = GameRoom & {
   pendingDirectAttack?: PendingDirectAttack | null;
   attackTarget?: ActiveAttackTarget | null;
@@ -61,6 +74,7 @@ type ExtendedRoom = GameRoom & {
     playerName: string;
     cards: BattleCardInstance[];
   } | null;
+  publicHandReveal?: PublicHandReveal | null;
 };
 
 interface RoomUpdateMeta {
@@ -73,7 +87,6 @@ interface RoomUpdateMeta {
   };
 }
 
-// public/sounds/ 内のMP3ファイル名マッピング（半角英数字・日本語の両方に自動対応）
 const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
   shieldBreak: ['/sounds/shield.mp3', '/sounds/ガラスが割れる1.mp3', '/sounds/ガラスが割れる1.mp3.mp3'],
   summon: ['/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
@@ -84,7 +97,6 @@ const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
   attack: ['/sounds/attack.mp3', '/sounds/大パンチ.mp3', '/sounds/大パンチ.mp3.mp3'],
 };
 
-// 合成音フォールバック＆ターンエンド・ブロック音
 function playSynthFallback(type: SoundEventType) {
   try {
     const AudioCtx =
@@ -152,7 +164,6 @@ function playSynthFallback(type: SoundEventType) {
 let lastGlobalSoundType: SoundEventType | null = null;
 let lastGlobalSoundTime = 0;
 
-// 効果音再生メイン関数（候補のMP3を順番に試して確実に再生・短時間の重複鳴りを防止）
 function playGameSound(type: SoundEventType) {
   try {
     const nowMs = Date.now();
@@ -316,6 +327,22 @@ function BattleRoomContent() {
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
+  const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false);
+
+  // ターン切り替わり視覚バナー
+  const [turnBanner, setTurnBanner] = useState<TurnBannerState | null>(null);
+
+  // シールド複数同時選択・チェックモード
+  const [multiShieldSelectMode, setMultiShieldSelectMode] = useState<boolean>(false);
+  const [selectedShieldIds, setSelectedShieldIds] = useState<string[]>([]);
+  const [shieldCheckQueue, setShieldCheckQueue] = useState<BattleCardInstance[]>([]);
+
+  // 手札公開モード（自分の手札から相手に見せるカードを選ぶ）
+  const [handRevealModalOpen, setHandRevealModalOpen] = useState<boolean>(false);
+  const [selectedRevealHandIds, setSelectedRevealHandIds] = useState<string[]>([]);
+
+  // 墓地横並びモーダル内でタップされたカード
+  const [selectedGraveCard, setSelectedGraveCard] = useState<BattleCardInstance | null>(null);
 
   // 攻撃先指定モード用state
   const [targetingAttacker, setTargetingAttacker] = useState<BattleCardInstance | null>(null);
@@ -323,6 +350,8 @@ function BattleRoomContent() {
   const [selectedTargetCreatureId, setSelectedTargetCreatureId] = useState<string | null>(null);
 
   const roomRef = useRef<ExtendedRoom | null>(null);
+  const myPlayerIdRef = useRef<string>('');
+  const isSpectatorRef = useRef<boolean>(false);
   const isUpdatingRef = useRef<boolean>(false);
   const lastUpdateAtRef = useRef<number>(0);
   const prevTurnCountRef = useRef<number | null>(null);
@@ -340,6 +369,10 @@ function BattleRoomContent() {
   useEffect(() => {
     roomRef.current = room;
   }, [room]);
+
+  useEffect(() => {
+    myPlayerIdRef.current = myPlayerId;
+  }, [myPlayerId]);
 
   const [selectedCard, setSelectedCard] = useState<{
     card: BattleCardInstance;
@@ -383,12 +416,33 @@ function BattleRoomContent() {
 
   const [resetting, setResetting] = useState(false);
 
-  // 1回の操作につき1回だけDB保存し、二重送信・連打をロックで防ぐ
+  const triggerTurnBanner = useCallback((data: ExtendedRoom) => {
+    const pid = myPlayerIdRef.current;
+    const spectator = isSpectatorRef.current;
+    const ownerName = data.players?.[data.turnPlayerId]?.name || 'プレイヤー';
+    const mine = !spectator && !!pid && data.turnPlayerId === pid;
+    const bannerId = `turn-${data.turnCount}-${data.turnPlayerId}`;
+    setTurnBanner({
+      id: bannerId,
+      turnCount: data.turnCount || 1,
+      turnPlayerName: ownerName,
+      isMyTurn: mine,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!turnBanner) return;
+    const timer = setTimeout(() => {
+      setTurnBanner(null);
+    }, 2200);
+    return () => clearTimeout(timer);
+  }, [turnBanner]);
+
   const applyRoomUpdate = useCallback(
     async (updater: (current: ExtendedRoom) => ExtendedRoom, meta?: RoomUpdateMeta) => {
       if (!roomId) return;
       const now = Date.now();
-      if (isUpdatingRef.current || now - lastUpdateAtRef.current < 400) {
+      if (isUpdatingRef.current || now - lastUpdateAtRef.current < 350) {
         return;
       }
 
@@ -458,6 +512,7 @@ function BattleRoomContent() {
   useEffect(() => {
     const savedId = localStorage.getItem('dm_player_id') || '';
     setMyPlayerId(savedId);
+    myPlayerIdRef.current = savedId;
 
     if (!roomId) return;
 
@@ -471,6 +526,10 @@ function BattleRoomContent() {
         return;
       }
 
+      const pIds = Object.keys(data.players || {});
+      const participant = !!myPlayerIdRef.current && pIds.includes(myPlayerIdRef.current);
+      isSpectatorRef.current = !participant || searchParams.get('spectate') === '1';
+
       if (
         prevTurnCountRef.current !== null &&
         prevTurnPlayerRef.current !== null &&
@@ -480,6 +539,7 @@ function BattleRoomContent() {
         if (soundEnabledRef.current) {
           playGameSound('turnEnd');
         }
+        triggerTurnBanner(data);
       }
       prevTurnCountRef.current = data.turnCount;
       prevTurnPlayerRef.current = data.turnPlayerId;
@@ -548,7 +608,7 @@ function BattleRoomContent() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [roomId, router]);
+  }, [roomId, router, searchParams, triggerTurnBanner]);
 
   if (!room) {
     return (
@@ -576,6 +636,7 @@ function BattleRoomContent() {
 
   const pendingDirectAttack = room.pendingDirectAttack || null;
   const activeAttackTarget = room.attackTarget || null;
+
   const amIDefendingDirectAttack =
     !isSpectator &&
     !!pendingDirectAttack &&
@@ -584,6 +645,11 @@ function BattleRoomContent() {
     !isSpectator &&
     !!pendingDirectAttack &&
     pendingDirectAttack.attackerPlayerId === myPlayerId;
+
+  const amIDefendingTargetedAttack =
+    !isSpectator &&
+    !!activeAttackTarget &&
+    activeAttackTarget.defenderPlayerId === myPlayerId;
 
   const isTargetOfAttack = (cardInstanceId: string, zone: 'shields' | 'battleZone'): boolean => {
     if (!activeAttackTarget) return false;
@@ -595,6 +661,8 @@ function BattleRoomContent() {
 
   const openAttackTargeting = (attacker: BattleCardInstance) => {
     setSelectedCard(null);
+    setMultiShieldSelectMode(false);
+    setSelectedShieldIds([]);
     setTargetingAttacker(attacker);
     setSelectedTargetShieldIds([]);
     setSelectedTargetCreatureId(null);
@@ -616,6 +684,12 @@ function BattleRoomContent() {
   const toggleTargetCreature = (creatureId: string) => {
     setSelectedTargetShieldIds([]);
     setSelectedTargetCreatureId((prev) => (prev === creatureId ? null : creatureId));
+  };
+
+  const toggleMultiShieldId = (shieldId: string) => {
+    setSelectedShieldIds((prev) =>
+      prev.includes(shieldId) ? prev.filter((id) => id !== shieldId) : [...prev, shieldId]
+    );
   };
 
   const updateMyState = async (
@@ -653,6 +727,86 @@ function BattleRoomContent() {
     }, meta);
   };
 
+  // 選択した複数シールドをまとめてチェック（表向きにして確認キューへ）
+  const handleCheckSelectedShields = () => {
+    if (!me || selectedShieldIds.length === 0) return;
+    const picked = (me.shields as BattleCardInstance[])
+      .filter((s) => selectedShieldIds.includes(s.instanceId))
+      .map((s) => ({ ...s, faceUp: true }));
+    setShieldCheckQueue(picked);
+  };
+
+  // 選択した複数シールドをまとめてブレイク
+  const handleBreakSelectedShields = async () => {
+    if (!me || isSpectator || selectedShieldIds.length === 0) return;
+    const idSet = new Set(selectedShieldIds);
+    const remainingShields = (me.shields as BattleCardInstance[]).filter(
+      (s) => !idSet.has(s.instanceId)
+    );
+    const brokenCards: BattleCardInstance[] = (me.shields as BattleCardInstance[])
+      .filter((s) => idSet.has(s.instanceId))
+      .map((s) => ({
+        ...s,
+        faceUp: true,
+        tapped: false,
+        underCards: [],
+        ignored: false,
+        shieldOverlaySlot: undefined,
+      }));
+
+    setMultiShieldSelectMode(false);
+    setSelectedShieldIds([]);
+    await updateMyState(
+      {
+        shields: remainingShields,
+        hand: [...(me.hand || []), ...brokenCards],
+      },
+      true,
+      { sound: 'shieldBreak' }
+    );
+  };
+
+  // 手札公開（選択した手札カードを相手に見せる）
+  const openHandRevealModal = () => {
+    const currentHand = (me?.hand || []) as BattleCardInstance[];
+    setSelectedRevealHandIds(currentHand.map((c) => c.instanceId));
+    setHandRevealModalOpen(true);
+  };
+
+  const toggleRevealHandCard = (cardId: string) => {
+    setSelectedRevealHandIds((prev) =>
+      prev.includes(cardId) ? prev.filter((id) => id !== cardId) : [...prev, cardId]
+    );
+  };
+
+  const handlePublishSelectedHand = async () => {
+    if (!me || !myPlayerId || isSpectator) return;
+    const targets = ((me.hand || []) as BattleCardInstance[]).filter((c) =>
+      selectedRevealHandIds.includes(c.instanceId)
+    );
+    if (targets.length === 0) {
+      return alert('相手に見せる手札を1枚以上選んでください');
+    }
+    setHandRevealModalOpen(false);
+    await applyRoomUpdate((cur) => ({
+      ...cur,
+      inspectingText: `${me.name} が手札（${targets.length}枚）を公開中！`,
+      publicHandReveal: {
+        playerId: myPlayerId,
+        playerName: me.name,
+        cards: targets.map((c) => ({ ...c, faceUp: true })),
+      },
+    }));
+  };
+
+  const handleStopPublicHandReveal = async () => {
+    await applyRoomUpdate((cur) => ({
+      ...cur,
+      inspectingText: null,
+      publicHandReveal: null,
+    }));
+  };
+
   const handleToggleMyIgnore = async (targetCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const nextIgnored = !targetCard.ignored;
@@ -686,7 +840,6 @@ function BattleRoomContent() {
     setInspectCard(null);
   };
 
-  // 【禁断専用】封印を1枚外す／乗せる／禁断解放（地響き.mp3再生！）／表裏画像アップロード
   const handleRemoveOneSeal = async (kindanCard: BattleCardInstance) => {
     if (!me || isSpectator) return;
     const seals = kindanCard.underCards || [];
@@ -917,8 +1070,11 @@ function BattleRoomContent() {
     setUndoStack((prev) => prev.slice(0, -1));
     setPeekState(null);
     setSelectedCard(null);
+    setSelectedGraveCard(null);
     setBrokenShieldCard(null);
     setEvolutionBuilder(null);
+    setSelectedShieldIds([]);
+    setShieldCheckQueue([]);
     cancelAttackTargeting();
     await applyRoomUpdate((cur) => {
       const curPlayers = cur.players || {};
@@ -927,6 +1083,7 @@ function BattleRoomContent() {
         ...cur,
         inspectingText: null,
         publicReveal: null,
+        publicHandReveal: null,
         pendingDirectAttack: null,
         attackTarget: null,
         players: {
@@ -1038,6 +1195,7 @@ function BattleRoomContent() {
         inspectingText: null,
         cutIn: null,
         publicReveal: null,
+        publicHandReveal: null,
         pendingDirectAttack: null,
         attackTarget: null,
       }));
@@ -1045,8 +1203,11 @@ function BattleRoomContent() {
       setUndoStack([]);
       setPeekState(null);
       setSelectedCard(null);
+      setSelectedGraveCard(null);
       setBrokenShieldCard(null);
       setEvolutionBuilder(null);
+      setSelectedShieldIds([]);
+      setShieldCheckQueue([]);
       cancelAttackTargeting();
     } catch (error) {
       console.error(error);
@@ -1075,6 +1236,10 @@ function BattleRoomContent() {
 
   const oppNormalBattleZone = oppBattleZone.filter((c) => !c.kindanRole);
   const oppKindanBattleZone = oppBattleZone.find((c) => c.kindanRole);
+
+  const topGraveyardCard = graveyard.length > 0 ? graveyard[graveyard.length - 1] : null;
+  const oppTopGraveyardCard =
+    oppGraveyard.length > 0 ? oppGraveyard[oppGraveyard.length - 1] : null;
 
   const handleTopDeckTo = async (dest: 'hand' | 'mana' | 'graveyard' | 'shields') => {
     if (!me || isSpectator || deck.length === 0) return alert('山札がありません');
@@ -1133,10 +1298,19 @@ function BattleRoomContent() {
     if (isSpectator) return;
     if (!topPlayerId) return alert('対戦相手がまだいません');
     cancelAttackTargeting();
+    const nextTurnCount = (room.turnCount || 1) + 1;
+    const nextTurnState: ExtendedRoom = {
+      ...room,
+      turnPlayerId: topPlayerId,
+      turnCount: nextTurnCount,
+      pendingDirectAttack: null,
+      attackTarget: null,
+    };
+    triggerTurnBanner(nextTurnState);
     await applyRoomUpdate((cur) => ({
       ...cur,
       turnPlayerId: topPlayerId,
-      turnCount: (cur.turnCount || 1) + 1,
+      turnCount: nextTurnCount,
       pendingDirectAttack: null,
       attackTarget: null,
     }));
@@ -1184,19 +1358,15 @@ function BattleRoomContent() {
       await updateMyState({ hand: [...hand, updatedCard] });
     } else if (dest === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
-      await updateMyState(
-        { battleZone: [...cleanBZ, updatedCard] },
-        true,
-        {
-          sound: 'summon',
-          cutIn: {
-            type: 'summon',
-            playerName: me.name,
-            card: updatedCard,
-            subText: '山札からバトルゾーンへ！',
-          },
-        }
-      );
+      await updateMyState({ battleZone: [...cleanBZ, updatedCard] }, true, {
+        sound: 'summon',
+        cutIn: {
+          type: 'summon',
+          playerName: me.name,
+          card: updatedCard,
+          subText: '山札からバトルゾーンへ！',
+        },
+      });
     } else if (dest === 'mana') {
       await updateMyState({ mana: [...mana, updatedCard] });
     } else if (dest === 'graveyard') {
@@ -1264,7 +1434,6 @@ function BattleRoomContent() {
     let nextBZ = [...battleZone];
     let nextGrave = [...graveyard];
 
-    // バトルゾーンから墓地へ送る際、進化元（underCards）があれば一番上の進化元を場に残し、進化カードのみを墓地へ送る
     const isTopEvolutionToGraveyard =
       fromZone === 'battleZone' &&
       toZone === 'graveyard' &&
@@ -1290,9 +1459,7 @@ function BattleRoomContent() {
         ignored: false,
         shieldOverlaySlot: undefined,
       };
-      nextBZ = nextBZ.map((c) =>
-        c.instanceId === card.instanceId ? promotedUnderCard : c
-      );
+      nextBZ = nextBZ.map((c) => (c.instanceId === card.instanceId ? promotedUnderCard : c));
     } else {
       if (fromZone === 'hand') nextHand = removeFrom(nextHand);
       if (fromZone === 'mana') nextMana = removeFrom(nextMana);
@@ -1308,12 +1475,11 @@ function BattleRoomContent() {
       ...card,
       tapped: false,
       faceUp: isFaceUpDest,
-      underCards:
-        isTopEvolutionToGraveyard
-          ? []
-          : toZone === 'battleZone'
-          ? card.underCards || []
-          : [],
+      underCards: isTopEvolutionToGraveyard
+        ? []
+        : toZone === 'battleZone'
+        ? card.underCards || []
+        : [],
       ignored: false,
       shieldOverlaySlot: toZone === 'shieldsFaceUp' ? shieldOverlaySlot : undefined,
     };
@@ -1363,6 +1529,7 @@ function BattleRoomContent() {
         : undefined;
 
     setSelectedCard(null);
+    setSelectedGraveCard(null);
     await updateMyState(
       {
         deck: nextDeck,
@@ -1387,7 +1554,6 @@ function BattleRoomContent() {
     setSelectedCard(null);
   };
 
-  // 攻撃宣言（攻撃先指定あり／なし両対応・大パンチ.mp3）
   const handleAttackDeclare = async (
     attacker: BattleCardInstance,
     targetOverride?: { shieldIds: string[]; creatureId: string | null }
@@ -1474,7 +1640,52 @@ function BattleRoomContent() {
     );
   };
 
-  // ダイレクトアタック宣言（大パンチ.mp3 → 相手が敗北承認で 爆発2.mp3）
+  // 通常攻撃（シールド／相手クリーチャー指定）に対するブロッカー宣言
+  const handleBlockTargetedAttack = async (blocker: BattleCardInstance) => {
+    if (!me || !activeAttackTarget || !myPlayerId) return;
+
+    const updatedBZ = battleZone.map((c) =>
+      c.instanceId === blocker.instanceId ? { ...c, tapped: true } : c
+    );
+    const snapshot = JSON.stringify({
+      deck: me.deck || [],
+      hand: me.hand || [],
+      mana: me.mana || [],
+      shields: me.shields || [],
+      battleZone: me.battleZone || [],
+      graveyard: me.graveyard || [],
+    });
+    setUndoStack((prev) => [...prev.slice(-19), snapshot]);
+    setTargetBlockModalOpen(false);
+
+    await applyRoomUpdate(
+      (cur) => {
+        const curPlayers = cur.players || {};
+        const curMe = curPlayers[myPlayerId] || me;
+        return {
+          ...cur,
+          attackTarget: null,
+          players: {
+            ...curPlayers,
+            [myPlayerId]: {
+              ...curMe,
+              battleZone: updatedBZ,
+            },
+          },
+        };
+      },
+      {
+        sound: 'block',
+        cutIn: {
+          type: 'ability',
+          playerName: me.name,
+          card: blocker,
+          subText: `🛡️ ブロッカー発動！${activeAttackTarget.attackerCardName} の攻撃をブロック！`,
+        },
+      }
+    );
+  };
+
   const handleDeclareDirectAttack = async (attacker: BattleCardInstance) => {
     if (!me || isSpectator) return;
     if (!topPlayerId) return alert('対戦相手がまだいません');
@@ -1533,7 +1744,6 @@ function BattleRoomContent() {
     );
   };
 
-  // 相手が「敗北を認める」を押した時（爆発2.mp3）
   const handleAcceptDefeat = async () => {
     if (!pendingDirectAttack || !me) return;
     const { attackerPlayerName, card } = pendingDirectAttack;
@@ -1556,7 +1766,6 @@ function BattleRoomContent() {
     );
   };
 
-  // 革命0トリガー発動（キャラ出し＝シャキーン1.mp3 / 呪文詠唱＝魔法陣を展開.mp3）
   const handleActivateRevZeroTrigger = async (
     card: BattleCardInstance,
     dest: 'battleZone' | 'graveyard'
@@ -1672,7 +1881,6 @@ function BattleRoomContent() {
     );
   };
 
-  // シールドブレイク（ガラスが割れる1.mp3）
   const handleBreakShield = async (card: BattleCardInstance, slotIndex?: number) => {
     if (!me || isSpectator) return;
     const slotLabel =
@@ -1714,7 +1922,6 @@ function BattleRoomContent() {
     });
   };
 
-  // 進化確定（シャキーン1.mp3）
   const handleConfirmFreeEvolution = async () => {
     if (!me || isSpectator || !evolutionBuilder || isEvolvingBusy) return;
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
@@ -1865,7 +2072,6 @@ function BattleRoomContent() {
     }
   };
 
-  // 革命チェンジ（シャキーン1.mp3）
   const handleExecuteRevolutionChange = async (targetCard: BattleCardInstance) => {
     if (!me || isSpectator || !revolutionChangePending) return;
     const { card: incomingCard, fromZone } = revolutionChangePending;
@@ -1978,19 +2184,15 @@ function BattleRoomContent() {
       await updateMyState({ deck: nextDeck, hand: [...hand, updatedCard] });
     } else if (toZone === 'battleZone') {
       const cleanBZ = battleZone.filter((c) => c.instanceId !== updatedCard.instanceId);
-      await updateMyState(
-        { deck: nextDeck, battleZone: [...cleanBZ, updatedCard] },
-        true,
-        {
-          sound: 'summon',
-          cutIn: {
-            type: 'summon',
-            playerName: me.name,
-            card: updatedCard,
-            subText: '山札からバトルゾーンへ！',
-          },
-        }
-      );
+      await updateMyState({ deck: nextDeck, battleZone: [...cleanBZ, updatedCard] }, true, {
+        sound: 'summon',
+        cutIn: {
+          type: 'summon',
+          playerName: me.name,
+          card: updatedCard,
+          subText: '山札からバトルゾーンへ！',
+        },
+      });
     } else if (toZone === 'mana') {
       await updateMyState({ deck: nextDeck, mana: [...mana, updatedCard] });
     } else if (toZone === 'graveyard') {
@@ -2015,6 +2217,9 @@ function BattleRoomContent() {
     const canClick = isControllable || showFace;
     const isKindan = !!card.kindanRole;
     const isIgnored = zone === 'battleZone' && !!card.ignored;
+
+    const isMyMultiSelectedShield =
+      isControllable && zone === 'shields' && selectedShieldIds.includes(card.instanceId);
 
     const isOpponentZone = !isControllable && !isSpectator;
     const isPickedInTargetingMode =
@@ -2068,6 +2273,11 @@ function BattleRoomContent() {
             return;
           }
 
+          if (zone === 'shields' && multiShieldSelectMode) {
+            toggleMultiShieldId(card.instanceId);
+            return;
+          }
+
           if (zone === 'shields' && !card.faceUp) {
             handleBreakShield(card, index);
             return;
@@ -2098,8 +2308,13 @@ function BattleRoomContent() {
           setSelectedCard({ card, zone, shieldSlotIndex: zone === 'shields' ? index : undefined });
         }}
         title={
-          !isSpectator && targetingAttacker && isOpponentZone && (zone === 'shields' || zone === 'battleZone')
+          !isSpectator &&
+          targetingAttacker &&
+          isOpponentZone &&
+          (zone === 'shields' || zone === 'battleZone')
             ? `${slotName}（タップで攻撃対象に指定/解除）`
+            : zone === 'shields' && multiShieldSelectMode
+            ? `${slotName}（タップで複数選択/解除）`
             : zone === 'shields' && !card.faceUp
             ? `${slotName}（タップでブレイク）`
             : showFace
@@ -2107,18 +2322,32 @@ function BattleRoomContent() {
             : '裏向きカード'
         }
         className={`relative select-none transition-all shrink-0 ${
-          canClick || (!isSpectator && targetingAttacker && isOpponentZone && (zone === 'shields' || zone === 'battleZone'))
+          canClick ||
+          (!isSpectator &&
+            targetingAttacker &&
+            isOpponentZone &&
+            (zone === 'shields' || zone === 'battleZone'))
             ? 'cursor-pointer active:scale-95'
             : 'cursor-default'
         } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
           isIgnored ? 'brightness-50 saturate-50' : ''
-        } ${isGlowingTarget ? 'ring-4 ring-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.95)] scale-105 z-10 animate-pulse rounded-md' : ''} ${
-          underCount > 0 ? 'mt-2 ml-1.5' : ''
-        }`}
+        } ${
+          isGlowingTarget
+            ? 'ring-4 ring-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.95)] scale-105 z-10 animate-pulse rounded-md'
+            : isMyMultiSelectedShield
+            ? 'ring-4 ring-sky-400 shadow-[0_0_16px_rgba(56,189,248,0.9)] -translate-y-1 z-10 rounded-md'
+            : ''
+        } ${underCount > 0 ? 'mt-2 ml-1.5' : ''}`}
       >
         {isGlowingTarget && (
-          <span className=" -top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-rose-600 text-white border border-yellow-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
+          <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-rose-600 text-white border border-yellow-300 text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
             🎯 攻撃対象
+          </span>
+        )}
+
+        {isMyMultiSelectedShield && (
+          <span className="-top-2.5 left-1/2 -translate-x-1/2 absolute whitespace-nowrap bg-sky-500 text-slate-950 border border-white text-[9px] font-extrabold px-1.5 py-0.5 rounded-full shadow-lg z-20 pointer-events-none">
+            ✓ 選択中
           </span>
         )}
 
@@ -2249,12 +2478,56 @@ function BattleRoomContent() {
     );
   };
 
+  // 墓地ゾーンの「一番最新のカードだけ上に表示＋タップで横並び一覧を開く」ウィジェット
+  const renderGraveyardStackWidget = (
+    topCard: BattleCardInstance | null,
+    count: number,
+    onOpenList: () => void,
+    accentClass: string
+  ) => (
+    <div
+      onClick={onOpenList}
+      title="タップで墓地一覧を開く"
+      className={`cursor-pointer select-none bg-slate-950/90 border ${accentClass} rounded-xl p-2 flex flex-col items-center justify-center min-w-[84px] sm:min-w-[96px] hover:scale-105 transition shrink-0 shadow-md`}
+    >
+      <div className="text-[10px] font-extrabold text-slate-300 mb-1">墓地 ({count})</div>
+      {topCard ? (
+        <div className="relative w-14 h-20 sm:w-16 sm:h-24 rounded-md overflow-hidden border border-slate-500 bg-slate-800 shadow">
+          {topCard.imageUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={topCard.imageUrl}
+              alt={topCard.name}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-[9px] font-bold text-center p-1">
+              {topCard.name}
+            </div>
+          )}
+          <span className="absolute bottom-0 inset-x-0 bg-black/85 text-[8px] font-extrabold text-amber-300 text-center py-0.5 truncate px-1">
+            最新
+          </span>
+        </div>
+      ) : (
+        <div className="w-14 h-20 sm:w-16 sm:h-24 rounded-md border border-dashed border-slate-700 flex items-center justify-center text-[10px] text-slate-600 font-bold">
+          空
+        </div>
+      )}
+    </div>
+  );
+
   const tappedManaCount = mana.filter((c) => c.tapped).length;
   const untappedManaCount = mana.length - tappedManaCount;
   const turnOwnerName = playersObj[room.turnPlayerId]?.name || 'プレイヤー';
 
   const activePublicReveal =
     room.publicReveal && room.publicReveal.playerName !== me?.name ? room.publicReveal : null;
+
+  const activeOpponentHandReveal =
+    room.publicHandReveal && room.publicHandReveal.playerId !== myPlayerId
+      ? room.publicHandReveal
+      : null;
 
   const getEvolutionCandidates = (): BattleCardInstance[] => {
     if (!evolutionBuilder) return [];
@@ -2295,6 +2568,28 @@ function BattleRoomContent() {
     <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-2 sm:p-4 max-w-6xl mx-auto">
       <CutInOverlay event={room.cutIn} />
 
+      {/* ターン切り替わり視覚バナー */}
+      {turnBanner && (
+        <div className="fixed inset-x-0 top-16 flex justify-center z-50 pointer-events-none px-4">
+          <div
+            className={`px-6 py-3 rounded-2xl border-2 shadow-2xl text-center backdrop-blur-md transition-all animate-bounce ${
+              turnBanner.isMyTurn
+                ? 'bg-emerald-950/95 border-emerald-400 text-emerald-200'
+                : 'bg-amber-950/95 border-amber-400 text-amber-200'
+            }`}
+          >
+            <div className="text-[11px] font-extrabold uppercase tracking-widest opacity-90">
+              TURN {turnBanner.turnCount}
+            </div>
+            <div className="text-lg sm:text-2xl font-black">
+              {turnBanner.isMyTurn
+                ? '⚡ あなたのターンに切り替わりました！'
+                : `🔄 ${turnBanner.turnPlayerName} のターンに切り替わりました`}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 上部バー */}
       <header className="flex flex-wrap items-center justify-between gap-2 bg-slate-900 p-2.5 rounded-lg border border-slate-800">
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
@@ -2315,15 +2610,19 @@ function BattleRoomContent() {
               </button>
             </div>
           )}
-          <span className="text-xs sm:text-sm font-bold">
+          <span
+            className={`text-xs sm:text-sm font-extrabold px-2.5 py-1 rounded border ${
+              isMyTurn
+                ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-300'
+                : 'bg-amber-950/60 border-amber-500/40 text-amber-300'
+            }`}
+          >
             ターン {room.turnCount}：
-            <span className={isMyTurn ? 'text-emerald-400' : 'text-amber-300'}>
-              {isSpectator
-                ? `${turnOwnerName}のターン`
-                : isMyTurn
-                ? 'あなたのターン'
-                : `${opponent?.name || '相手'}のターン`}
-            </span>
+            {isSpectator
+              ? `${turnOwnerName}のターン`
+              : isMyTurn
+              ? 'あなたのターン'
+              : `${opponent?.name || '相手'}のターン`}
           </span>
         </div>
 
@@ -2347,6 +2646,13 @@ function BattleRoomContent() {
 
           {!isSpectator && (
             <>
+              <button
+                type="button"
+                onClick={openHandRevealModal}
+                className="px-2.5 py-1.5 bg-fuchsia-700 hover:bg-fuchsia-600 border border-fuchsia-300/60 rounded text-xs font-extrabold"
+              >
+                🃏 手札を見せる
+              </button>
               <button
                 type="button"
                 onClick={() => setDirectAttackModalOpen(true)}
@@ -2420,6 +2726,64 @@ function BattleRoomContent() {
         </div>
       </header>
 
+      {/* 自分が相手に見せている手札の終了バー */}
+      {!isSpectator && room.publicHandReveal && room.publicHandReveal.playerId === myPlayerId && (
+        <div className="my-1.5 p-2 bg-fuchsia-950/90 border border-fuchsia-400 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-fuchsia-100">
+          <span>
+            🃏 相手に手札（{room.publicHandReveal.cards.length}枚）を公開中です
+          </span>
+          <button
+            type="button"
+            onClick={handleStopPublicHandReveal}
+            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] shrink-0"
+          >
+            公開をやめる
+          </button>
+        </div>
+      )}
+
+      {/* 相手から公開された手札の表示エリア */}
+      {activeOpponentHandReveal && activeOpponentHandReveal.cards.length > 0 && (
+        <div className="my-1.5 p-3 bg-fuchsia-950/90 border-2 border-fuchsia-400 rounded-xl space-y-2 shadow-xl">
+          <div className="flex items-center justify-between text-xs font-bold text-fuchsia-200">
+            <span>
+              🃏 {activeOpponentHandReveal.playerName} が手札を公開中！（タップで拡大）
+            </span>
+            <span>{activeOpponentHandReveal.cards.length} 枚</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {activeOpponentHandReveal.cards.map((c) => (
+              <div
+                key={c.instanceId}
+                onClick={() =>
+                  setInspectCard({
+                    card: c,
+                    ownerName: activeOpponentHandReveal.playerName,
+                  })
+                }
+                className="cursor-pointer bg-slate-900 border border-fuchsia-400/70 rounded-lg p-1.5 flex flex-col items-center w-20 sm:w-24 hover:scale-105 transition"
+              >
+                {c.imageUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={c.imageUrl}
+                    alt={c.name}
+                    className="w-16 h-22 sm:w-20 sm:h-28 object-cover rounded"
+                  />
+                ) : (
+                  <div className="w-16 h-22 bg-slate-800 rounded flex items-center justify-center text-[10px] text-center p-1">
+                    {c.name}
+                  </div>
+                )}
+                <span className="text-[10px] font-bold truncate w-full text-center mt-1">
+                  {c.name}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* 攻撃先指定モード中の操作バー */}
       {!isSpectator && targetingAttacker && (
         <div className="my-1.5 p-2.5 bg-rose-950/95 border-2 border-rose-400 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold shadow-xl">
@@ -2433,7 +2797,7 @@ function BattleRoomContent() {
                 ? `相手クリーチャー「${selectedCreatureForBar.name}」`
                 : selectedShieldLabelsForBar.length > 0
                 ? `シールド ${selectedShieldLabelsForBar.join('・')}`
-                : '未選択（このまま攻撃宣言も可）'}
+                : '未選択（攻撃先なしでそのまま攻撃宣言も可）'}
             </div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
@@ -2460,28 +2824,37 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* 相手から狙われている側への通知バナー */}
-      {!isSpectator && activeAttackTarget && activeAttackTarget.defenderPlayerId === myPlayerId && (
-        <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-rose-500 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-rose-100 animate-pulse">
+      {/* 相手から狙われている側への通知＋ブロッカー対応バナー */}
+      {amIDefendingTargetedAttack && activeAttackTarget && (
+        <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-rose-500 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-rose-100 animate-pulse">
           <span>
             🎯 {activeAttackTarget.attackerPlayerName} の「{activeAttackTarget.attackerCardName}」が光っている対象を狙っています！
           </span>
-          <button
-            type="button"
-            onClick={async () => {
-              await applyRoomUpdate((cur) => ({
-                ...cur,
-                attackTarget: null,
-              }));
-            }}
-            className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] shrink-0 text-slate-200"
-          >
-            表示を消す
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setTargetBlockModalOpen(true)}
+              className="px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white border border-sky-300 rounded text-[11px] font-extrabold"
+            >
+              🛡️ ブロッカーでブロック
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                await applyRoomUpdate((cur) => ({
+                  ...cur,
+                  attackTarget: null,
+                }));
+              }}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] text-slate-200"
+            >
+              表示を消す
+            </button>
+          </div>
         </div>
       )}
 
-      {/* ダイレクトアタック宣言送信後の待機バナー（攻撃側） */}
+      {/* ダイレクトアタック宣言送信後の待機バナー */}
       {amIWaitingDirectAttack && pendingDirectAttack && (
         <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-amber-400 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-amber-200 animate-pulse">
           <span>
@@ -2556,19 +2929,10 @@ function BattleRoomContent() {
             <span>山札: {oppDeck.length}</span>
             <span>手札: {oppHand.length}</span>
             <span>マナ: {oppMana.length}</span>
-            {opponent && (
-              <button
-                type="button"
-                onClick={() => setOppGraveViewOpen(true)}
-                className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-rose-500/50 rounded text-rose-300 font-bold"
-              >
-                墓地: {oppGraveyard.length}（見る）
-              </button>
-            )}
+            <span>墓地: {oppGraveyard.length}</span>
           </div>
         </div>
 
-        {/* 観戦モード専用：プレイヤー1の手札表示 */}
         {isSpectator && opponent && (
           <div className="bg-slate-950/90 p-2 rounded-lg border border-indigo-500/40">
             <div className="text-[10px] text-rose-300 font-bold mb-1">
@@ -2576,14 +2940,7 @@ function BattleRoomContent() {
             </div>
             <div className="flex flex-wrap gap-1.5 min-h-[68px]">
               {oppHand.map((c) =>
-                renderCard(
-                  c,
-                  'hand',
-                  false,
-                  opponent.name,
-                  undefined,
-                  !spectatorShowHands
-                )
+                renderCard(c, 'hand', false, opponent.name, undefined, !spectatorShowHands)
               )}
             </div>
           </div>
@@ -2594,13 +2951,23 @@ function BattleRoomContent() {
           {oppMana.map((c) => renderCard(c, 'mana', false, opponent?.name || '相手'))}
         </div>
 
-        <div className="flex flex-wrap gap-1.5 min-h-[40px] bg-slate-950/50 p-1.5 rounded items-center">
-          <span className="text-[10px] text-slate-500 mr-1">
-            シールド ({oppShields.length}枚):
-          </span>
-          {oppShields.map((c, idx) =>
-            renderCard(c, 'shields', false, opponent?.name || '相手', idx)
-          )}
+        {/* 相手シールドゾーン ＋ 隣に相手墓地（最新1枚表示・タップで横並び一覧） */}
+        <div className="flex items-stretch justify-between gap-2 bg-slate-950/50 p-1.5 rounded">
+          <div className="flex flex-wrap gap-1.5 min-h-[40px] items-center flex-1">
+            <span className="text-[10px] text-slate-500 mr-1">
+              シールド ({oppShields.length}枚):
+            </span>
+            {oppShields.map((c, idx) =>
+              renderCard(c, 'shields', false, opponent?.name || '相手', idx)
+            )}
+          </div>
+          {opponent &&
+            renderGraveyardStackWidget(
+              oppTopGraveyardCard,
+              oppGraveyard.length,
+              () => setOppGraveViewOpen(true),
+              'border-rose-500/50'
+            )}
         </div>
 
         {/* 相手バトルゾーン */}
@@ -2632,13 +2999,7 @@ function BattleRoomContent() {
               <span>山札: {deck.length}</span>
               <span>手札: {hand.length}</span>
               <span>マナ: {mana.length}</span>
-              <button
-                type="button"
-                onClick={() => setGraveSearchOpen(true)}
-                className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-emerald-500/50 rounded text-emerald-300 font-bold"
-              >
-                墓地: {graveyard.length}（見る）
-              </button>
+              <span>墓地: {graveyard.length}</span>
             </div>
           </div>
         )}
@@ -2658,90 +3019,143 @@ function BattleRoomContent() {
           )}
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950/60 p-2 rounded">
-          <div className="flex flex-wrap gap-1.5 items-center">
-            <span className="text-[10px] text-amber-400 font-bold mr-1">
-              シールド ({shields.length}枚){!isSpectator && '(S1〜S5タップでブレイク／表盾タップで拡大)'}:
-            </span>
-            {shields.map((c, idx) =>
-              renderCard(c, 'shields', !isSpectator, me?.name || '自分', idx)
+        {/* 自分シールドゾーン ＋ 隣に自分墓地（最新1枚表示・タップで横並び一覧） */}
+        <div className="flex flex-col sm:flex-row items-stretch justify-between gap-2 bg-slate-950/60 p-2 rounded">
+          <div className="flex-1 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[10px] text-amber-400 font-bold">
+                シールド ({shields.length}枚)
+                {!isSpectator &&
+                  (multiShieldSelectMode
+                    ? ' ※複数選択中（タップでON/OFF）'
+                    : ' ※S1〜S5タップでブレイク／表盾タップで拡大')}
+              </span>
+              {!isSpectator && shields.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMultiShieldSelectMode((prev) => {
+                        const next = !prev;
+                        if (!next) setSelectedShieldIds([]);
+                        return next;
+                      });
+                    }}
+                    className={`px-2 py-1 rounded text-[11px] font-extrabold border transition ${
+                      multiShieldSelectMode
+                        ? 'bg-sky-500 text-slate-950 border-white'
+                        : 'bg-slate-800 hover:bg-slate-700 text-sky-300 border-sky-500/50'
+                    }`}
+                  >
+                    {multiShieldSelectMode ? '✕ 複数選択を終了' : '🛡️ シールド複数選択'}
+                  </button>
+                  {multiShieldSelectMode && selectedShieldIds.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handleCheckSelectedShields}
+                        className="px-2 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 rounded text-[11px] font-extrabold"
+                      >
+                        👁️ 選択{selectedShieldIds.length}枚をまとめて確認
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleBreakSelectedShields}
+                        className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[11px] font-extrabold"
+                      >
+                        💥 選択{selectedShieldIds.length}枚をブレイク
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap gap-1.5 items-center min-h-[48px]">
+              {shields.map((c, idx) =>
+                renderCard(c, 'shields', !isSpectator, me?.name || '自分', idx)
+              )}
+            </div>
+
+            {!isSpectator && (
+              <div className="flex flex-wrap gap-1.5 items-center pt-1">
+                <button
+                  onClick={() => handleTopDeckTo('hand')}
+                  className="px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 rounded text-xs font-bold"
+                >
+                  1ドロー ({deck.length})
+                </button>
+                <button
+                  onClick={() => handleTopDeckTo('mana')}
+                  className="px-2.5 py-1.5 bg-lime-700 hover:bg-lime-600 rounded text-xs font-bold"
+                >
+                  山札→マナ
+                </button>
+                <button
+                  onClick={() => handleTopDeckTo('graveyard')}
+                  className="px-2.5 py-1.5 bg-rose-800 hover:bg-rose-700 rounded text-xs font-bold"
+                >
+                  山札→墓地
+                </button>
+                <button
+                  onClick={() => handleTopDeckTo('shields')}
+                  className="px-2.5 py-1.5 bg-amber-700 hover:bg-amber-600 rounded text-xs font-bold"
+                >
+                  山札→シールド
+                </button>
+
+                <div className="flex items-center bg-indigo-950 border border-indigo-500 rounded overflow-hidden">
+                  <select
+                    value={peekCount}
+                    onChange={(e) => setPeekCount(Number(e.target.value))}
+                    className="bg-indigo-950 text-white text-xs font-bold px-2 py-1.5 focus:outline-none cursor-pointer"
+                  >
+                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => (
+                      <option key={num} value={num}>
+                        {num === 1 ? '1枚(トップ)' : `${num}枚`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => handlePeekTopDeck(peekCount, false)}
+                    title="相手には見せず自分だけ確認します"
+                    className="px-2 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-bold border-l border-indigo-400/40"
+                  >
+                    🔒 自分だけ見る
+                  </button>
+                  <button
+                    onClick={() => handlePeekTopDeck(peekCount, true)}
+                    title="相手にもカードを見せながらめくって選びます"
+                    className="px-2 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 text-xs font-extrabold border-l border-amber-300/40"
+                  >
+                    👁️ 相手に見せてめくる
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => setDeckSearchOpen(true)}
+                  className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
+                >
+                  山札全確認
+                </button>
+                <button
+                  onClick={handleShuffle}
+                  className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                >
+                  シャッフル
+                </button>
+              </div>
             )}
           </div>
 
-          {!isSpectator && (
-            <div className="flex flex-wrap gap-1.5 items-center">
-              <button
-                onClick={() => handleTopDeckTo('hand')}
-                className="px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 rounded text-xs font-bold"
-              >
-                1ドロー ({deck.length})
-              </button>
-              <button
-                onClick={() => handleTopDeckTo('mana')}
-                className="px-2.5 py-1.5 bg-lime-700 hover:bg-lime-600 rounded text-xs font-bold"
-              >
-                山札→マナ
-              </button>
-              <button
-                onClick={() => handleTopDeckTo('graveyard')}
-                className="px-2.5 py-1.5 bg-rose-800 hover:bg-rose-700 rounded text-xs font-bold"
-              >
-                山札→墓地
-              </button>
-              <button
-                onClick={() => handleTopDeckTo('shields')}
-                className="px-2.5 py-1.5 bg-amber-700 hover:bg-amber-600 rounded text-xs font-bold"
-              >
-                山札→シールド
-              </button>
-
-              <div className="flex items-center bg-indigo-950 border border-indigo-500 rounded overflow-hidden">
-                <select
-                  value={peekCount}
-                  onChange={(e) => setPeekCount(Number(e.target.value))}
-                  className="bg-indigo-950 text-white text-xs font-bold px-2 py-1.5 focus:outline-none cursor-pointer"
-                >
-                  {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => (
-                    <option key={num} value={num}>
-                      {num === 1 ? '1枚(トップ)' : `${num}枚`}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  onClick={() => handlePeekTopDeck(peekCount, false)}
-                  title="相手には見せず自分だけ確認します"
-                  className="px-2 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-bold border-l border-indigo-400/40"
-                >
-                  🔒 自分だけ見る
-                </button>
-                <button
-                  onClick={() => handlePeekTopDeck(peekCount, true)}
-                  title="相手にもカードを見せながらめくって選びます"
-                  className="px-2 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 text-xs font-extrabold border-l border-amber-300/40"
-                >
-                  👁️ 相手に見せてめくる
-                </button>
-              </div>
-
-              <button
-                onClick={() => setDeckSearchOpen(true)}
-                className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
-              >
-                山札全確認
-              </button>
-              <button
-                onClick={handleShuffle}
-                className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-              >
-                シャッフル
-              </button>
-              <button
-                onClick={() => setGraveSearchOpen(true)}
-                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-xs text-rose-300 font-bold"
-              >
-                墓地 ({graveyard.length})
-              </button>
-            </div>
+          {renderGraveyardStackWidget(
+            topGraveyardCard,
+            graveyard.length,
+            () => {
+              setSelectedGraveCard(null);
+              setGraveSearchOpen(true);
+            },
+            'border-emerald-500/50'
           )}
         </div>
 
@@ -2783,6 +3197,214 @@ function BattleRoomContent() {
           </div>
         </div>
       </section>
+
+      {/* ================= シールド複数同時チェックモーダル ================= */}
+      {shieldCheckQueue.length > 0 && (
+        <div
+          onClick={() => setShieldCheckQueue([])}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-amber-400 rounded-2xl p-4 max-w-3xl w-full max-h-[90vh] flex flex-col space-y-3 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-sm sm:text-base text-amber-300">
+                🛡️ 選択したシールドを同時確認中（{shieldCheckQueue.length}枚）
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShieldCheckQueue([])}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
+              >
+                閉じる
+              </button>
+            </div>
+            <div className="overflow-x-auto flex gap-3 py-2 items-center">
+              {shieldCheckQueue.map((c) => (
+                <div
+                  key={c.instanceId}
+                  onClick={() => setInspectCard({ card: c, ownerName: me?.name || '自分' })}
+                  className="cursor-pointer bg-slate-800 border border-amber-400/70 rounded-xl p-2 flex flex-col items-center w-28 sm:w-32 shrink-0 hover:scale-105 transition"
+                >
+                  {c.imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={c.imageUrl}
+                      alt={c.name}
+                      className="w-24 h-34 object-cover rounded border border-slate-600"
+                    />
+                  ) : (
+                    <div className="w-24 h-34 bg-slate-700 rounded flex items-center justify-center text-xs font-bold text-center p-1">
+                      {c.name}
+                    </div>
+                  )}
+                  <span className="text-[11px] font-bold truncate w-full text-center mt-1.5">
+                    {c.name}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= 相手に手札を見せるカード選択モーダル ================= */}
+      {!isSpectator && handRevealModalOpen && (
+        <div
+          onClick={() => setHandRevealModalOpen(false)}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-fuchsia-400 rounded-2xl p-4 max-w-2xl w-full max-h-[90vh] flex flex-col space-y-3 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-sm sm:text-base text-fuchsia-300">
+                🃏 相手に見せる手札を選択（{selectedRevealHandIds.length}枚選択中）
+              </h3>
+              <button
+                type="button"
+                onClick={() => setHandRevealModalOpen(false)}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
+              >
+                閉じる
+              </button>
+            </div>
+
+            {hand.length === 0 ? (
+              <p className="text-xs text-slate-400 py-8 text-center">手札がありません</p>
+            ) : (
+              <div className="overflow-x-auto flex gap-2.5 py-2 items-center">
+                {hand.map((c) => {
+                  const picked = selectedRevealHandIds.includes(c.instanceId);
+                  return (
+                    <div
+                      key={c.instanceId}
+                      onClick={() => toggleRevealHandCard(c.instanceId)}
+                      className={`cursor-pointer rounded-xl p-2 border-2 flex flex-col items-center w-24 sm:w-28 shrink-0 transition ${
+                        picked
+                          ? 'bg-fuchsia-900/70 border-fuchsia-300 scale-105'
+                          : 'bg-slate-800 border-slate-700 opacity-75'
+                      }`}
+                    >
+                      {c.imageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={c.imageUrl}
+                          alt={c.name}
+                          className="w-20 h-28 object-cover rounded"
+                        />
+                      ) : (
+                        <div className="w-20 h-28 bg-slate-700 rounded flex items-center justify-center text-[10px] font-bold text-center p-1">
+                          {c.name}
+                        </div>
+                      )}
+                      <span className="text-[10px] font-bold truncate w-full text-center mt-1">
+                        {c.name}
+                      </span>
+                      <span
+                        className={`mt-1 px-2 py-0.5 rounded text-[9px] font-extrabold ${
+                          picked ? 'bg-fuchsia-400 text-slate-950' : 'bg-slate-700 text-slate-300'
+                        }`}
+                      >
+                        {picked ? '✓ 見せる' : '隠す'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2 border-t border-slate-700">
+              <button
+                type="button"
+                onClick={() => setHandRevealModalOpen(false)}
+                className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs font-bold"
+              >
+                キャンセル
+              </button>
+              <button
+                type="button"
+                onClick={handlePublishSelectedHand}
+                className="flex-[2] py-2.5 bg-fuchsia-600 hover:bg-fuchsia-500 text-white rounded-xl text-xs sm:text-sm font-extrabold"
+              >
+                👁️ 選択した {selectedRevealHandIds.length} 枚を相手に見せる！
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= 通常攻撃（シールド／相手キャラ指定）に対するブロッカー選択モーダル ================= */}
+      {!isSpectator && targetBlockModalOpen && activeAttackTarget && (
+        <div
+          onClick={() => setTargetBlockModalOpen(false)}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-sky-400 rounded-2xl p-4 max-w-lg w-full space-y-3 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-extrabold text-sm sm:text-base text-sky-300">
+                🛡️ 「{activeAttackTarget.attackerCardName}」をブロックするクリーチャーを選択
+              </h3>
+              <button
+                type="button"
+                onClick={() => setTargetBlockModalOpen(false)}
+                className="px-2.5 py-1 bg-slate-700 rounded text-xs font-bold"
+              >
+                閉じる
+              </button>
+            </div>
+
+            {battleZone.length === 0 ? (
+              <p className="text-xs text-slate-400 py-6 text-center">
+                バトルゾーンにクリーチャーがいません
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-[55vh] overflow-y-auto">
+                {battleZone.map((c) => {
+                  const img =
+                    c.kindanRole && c.kindanAwakened && c.kindanAwakenedImageUrl
+                      ? c.kindanAwakenedImageUrl
+                      : c.imageUrl;
+                  return (
+                    <button
+                      key={c.instanceId}
+                      type="button"
+                      onClick={() => handleBlockTargetedAttack(c)}
+                      className={`bg-slate-800 hover:bg-sky-900 border border-sky-400/70 rounded-xl p-2 flex flex-col items-center space-y-1.5 transition ${
+                        c.ignored ? 'brightness-50' : ''
+                      }`}
+                    >
+                      {img ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={img}
+                          alt={c.name}
+                          className="w-16 h-22 object-cover rounded"
+                        />
+                      ) : (
+                        <div className="w-16 h-22 bg-slate-700 rounded flex items-center justify-center text-[10px] p-1 text-center">
+                          {c.name}
+                        </div>
+                      )}
+                      <div className="text-[11px] font-bold truncate w-full text-center">
+                        {c.name}
+                      </div>
+                      <span className="w-full py-1 bg-sky-500 text-slate-950 rounded text-[10px] font-extrabold">
+                        🛡️ ブロックする
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ================= 【防御側専用】ダイレクトアタック迎撃・敗北選択モーダル ================= */}
       {amIDefendingDirectAttack && pendingDirectAttack && (
@@ -2960,7 +3582,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= ダイレクトアタック宣言クリーチャー選択モーダル（攻撃側） ================= */}
+      {/* ================= ダイレクトアタック宣言クリーチャー選択モーダル ================= */}
       {!isSpectator && directAttackModalOpen && (
         <div
           onClick={() => setDirectAttackModalOpen(false)}
@@ -3119,7 +3741,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー＆暗転＆シールド貼り付け ================= */}
+      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー ================= */}
       {inspectCard && (
         <div
           onClick={() => setInspectCard(null)}
@@ -3236,7 +3858,7 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 山札の上から1〜10枚めくり選択モーダル（非公開＆公開対応） ================= */}
+      {/* ================= 山札の上から1〜10枚めくり選択モーダル ================= */}
       {!isSpectator && peekState && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
           <div
@@ -3614,12 +4236,6 @@ function BattleRoomContent() {
                     🎯 攻撃先を指定して攻撃（盾・相手キャラ）
                   </button>
                   <button
-                    onClick={() => handleAttackDeclare(selectedCard.card)}
-                    className="py-2 bg-rose-800 hover:bg-rose-700 rounded col-span-2 text-xs"
-                  >
-                    🔥 そのまま攻撃宣言（タップ＆カード提示）
-                  </button>
-                  <button
                     onClick={() => handleDeclareDirectAttack(selectedCard.card)}
                     className="py-2 bg-gradient-to-r from-red-600 to-amber-500 hover:from-red-500 hover:to-amber-400 text-white rounded col-span-2 text-xs font-extrabold"
                   >
@@ -3636,17 +4252,14 @@ function BattleRoomContent() {
                       const c = selectedCard.card;
                       setSelectedCard(null);
                       if (me) {
-                        await applyRoomUpdate(
-                          (cur) => cur,
-                          {
-                            cutIn: {
-                              type: 'ability',
-                              playerName: me.name,
-                              card: c,
-                              subText: '能力発動！',
-                            },
-                          }
-                        );
+                        await applyRoomUpdate((cur) => cur, {
+                          cutIn: {
+                            type: 'ability',
+                            playerName: me.name,
+                            card: c,
+                            subText: '能力発動！',
+                          },
+                        });
                       }
                     }}
                     className="py-2 bg-cyan-600 hover:bg-cyan-500 rounded"
@@ -3776,7 +4389,6 @@ function BattleRoomContent() {
                   </button>
                 </div>
 
-                {/* シールドに表向きで乗せる（S1〜S5表記付き） */}
                 <div className="bg-amber-950/50 border border-amber-500/40 rounded-lg p-2 space-y-1.5">
                   <div className="text-[10px] font-bold text-amber-300 text-center">
                     🛡️ 表向きシールドとして乗せる（どの盾の上かS1〜S5表記）
@@ -3959,7 +4571,11 @@ function BattleRoomContent() {
                 >
                   {c.imageUrl && (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                    <img
+                      src={c.imageUrl}
+                      alt={c.name}
+                      className="w-8 h-11 object-cover rounded shrink-0"
+                    />
                   )}
                   <span className="truncate">{c.name}</span>
                 </button>
@@ -4005,7 +4621,11 @@ function BattleRoomContent() {
                   >
                     {c.imageUrl && (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                      <img
+                        src={c.imageUrl}
+                        alt={c.name}
+                        className="w-8 h-11 object-cover rounded shrink-0"
+                      />
                     )}
                     <div className="font-bold text-xs truncate underline">{c.name}</div>
                   </div>
@@ -4048,91 +4668,158 @@ function BattleRoomContent() {
         </div>
       )}
 
-      {/* ================= 自分の墓地全確認モーダル ================= */}
+      {/* ================= 自分の墓地（手札・マナ風横並びカード表示＋タップで移動ボタン） ================= */}
       {graveSearchOpen && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3">
+        <div
+          onClick={() => {
+            setGraveSearchOpen(false);
+            setSelectedGraveCard(null);
+          }}
+          className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-rose-500/70 rounded-2xl p-4 max-w-3xl w-full max-h-[88vh] flex flex-col space-y-3 shadow-2xl"
+          >
             <div className="flex justify-between items-center">
-              <h3 className="font-bold text-sm text-rose-300">
-                {me?.name || '自分'}の墓地の中身 ({graveyard.length}枚)
-              </h3>
+              <div>
+                <h3 className="font-extrabold text-sm sm:text-base text-rose-300">
+                  {me?.name || '自分'}の墓地 ({graveyard.length}枚)
+                </h3>
+                <p className="text-[11px] text-slate-400">
+                  カードをタップすると、山札やマナなどへ送るボタンが表示されます
+                </p>
+              </div>
               <button
-                onClick={() => setGraveSearchOpen(false)}
-                className="px-3 py-1 bg-slate-700 rounded text-xs"
+                onClick={() => {
+                  setGraveSearchOpen(false);
+                  setSelectedGraveCard(null);
+                }}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-bold"
               >
                 閉じる
               </button>
             </div>
+
             {graveyard.length === 0 ? (
-              <p className="text-xs text-slate-400 py-6 text-center">墓地にカードはありません</p>
+              <p className="text-xs text-slate-400 py-8 text-center">墓地にカードはありません</p>
             ) : (
-              <div className="overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2">
-                {graveyard.map((c) => (
-                  <div
-                    key={c.instanceId}
-                    className="p-2 bg-slate-900 border border-slate-700 rounded flex items-center justify-between gap-2"
-                  >
+              <div className="overflow-x-auto flex gap-2.5 py-2 items-center min-h-[120px]">
+                {graveyard.map((c) => {
+                  const isPicked = selectedGraveCard?.instanceId === c.instanceId;
+                  return (
                     <div
-                      onClick={() => setInspectCard({ card: c, ownerName: me?.name || '自分' })}
-                      className="flex items-center gap-2 min-w-0 cursor-pointer"
+                      key={c.instanceId}
+                      onClick={() =>
+                        setSelectedGraveCard((prev) =>
+                          prev?.instanceId === c.instanceId ? null : c
+                        )
+                      }
+                      className={`cursor-pointer rounded-xl p-1.5 border-2 flex flex-col items-center w-20 sm:w-24 shrink-0 transition ${
+                        isPicked
+                          ? 'bg-amber-900/60 border-amber-400 scale-105'
+                          : 'bg-slate-800 border-slate-700 hover:border-slate-500'
+                      }`}
                     >
-                      {c.imageUrl && (
+                      {c.imageUrl ? (
                         // eslint-disable-next-line @next/next/no-img-element
-                        <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                        <img
+                          src={c.imageUrl}
+                          alt={c.name}
+                          className="w-16 h-24 object-cover rounded border border-slate-600"
+                        />
+                      ) : (
+                        <div className="w-16 h-24 bg-slate-700 rounded flex items-center justify-center text-[10px] font-bold text-center p-1">
+                          {c.name}
+                        </div>
                       )}
-                      <div className="font-bold text-xs truncate underline">{c.name}</div>
+                      <span className="text-[10px] font-bold truncate w-full text-center mt-1">
+                        {c.name}
+                      </span>
                     </div>
-                    {!isSpectator && (
-                      <div className="flex flex-wrap gap-1 shrink-0 text-[10px] font-bold">
-                        <button
-                          onClick={() => moveCard(c, 'graveyard', 'hand')}
-                          className="px-2 py-1 bg-sky-600 hover:bg-sky-500 rounded"
-                        >
-                          手札
-                        </button>
-                        <button
-                          onClick={() => moveCard(c, 'graveyard', 'battleZone')}
-                          className="px-2 py-1 bg-amber-600 hover:bg-amber-500 rounded"
-                        >
-                          場
-                        </button>
-                        <button
-                          onClick={() => {
-                            setGraveSearchOpen(false);
-                            setEvolutionBuilder({
-                              evolvingCard: c,
-                              fromZone: 'graveyard',
-                              activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'graveyard',
-                              selectedMaterials: [],
-                            });
-                          }}
-                          className="px-2 py-1 bg-purple-600 hover:bg-purple-500 rounded"
-                        >
-                          進化
-                        </button>
-                        <button
-                          onClick={() => moveCard(c, 'graveyard', 'mana')}
-                          className="px-2 py-1 bg-lime-700 hover:bg-lime-600 rounded"
-                        >
-                          マナ
-                        </button>
-                        <button
-                          onClick={() => moveCard(c, 'graveyard', 'deckBottom')}
-                          className="px-2 py-1 bg-indigo-800 hover:bg-indigo-700 rounded"
-                        >
-                          山札下
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
+              </div>
+            )}
+
+            {!isSpectator && selectedGraveCard && (
+              <div className="bg-slate-950 border border-amber-400/60 rounded-xl p-3 space-y-2">
+                <div className="flex items-center justify-between text-xs font-extrabold text-amber-300">
+                  <span>選択中：「{selectedGraveCard.name}」の移動先</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setInspectCard({
+                        card: selectedGraveCard,
+                        ownerName: me?.name || '自分',
+                      })
+                    }
+                    className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-[11px] text-sky-300"
+                  >
+                    🔍 拡大表示
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs font-bold">
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'hand')}
+                    className="py-2 bg-sky-600 hover:bg-sky-500 rounded-lg"
+                  >
+                    手札へ
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'battleZone')}
+                    className="py-2 bg-amber-600 hover:bg-amber-500 rounded-lg"
+                  >
+                    場に出す
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'mana')}
+                    className="py-2 bg-lime-700 hover:bg-lime-600 rounded-lg"
+                  >
+                    マナへ
+                  </button>
+                  <button
+                    onClick={() => {
+                      const target = selectedGraveCard;
+                      setGraveSearchOpen(false);
+                      setSelectedGraveCard(null);
+                      setEvolutionBuilder({
+                        evolvingCard: target,
+                        fromZone: 'graveyard',
+                        activeTab: normalBattleZone.length > 0 ? 'battleZone' : 'graveyard',
+                        selectedMaterials: [],
+                      });
+                    }}
+                    className="py-2 bg-purple-600 hover:bg-purple-500 rounded-lg"
+                  >
+                    🧬 進化
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'shields')}
+                    className="py-2 bg-amber-800 hover:bg-amber-700 rounded-lg"
+                  >
+                    シールドへ(裏)
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckTop')}
+                    className="py-2 bg-indigo-700 hover:bg-indigo-600 rounded-lg"
+                  >
+                    山札の上へ
+                  </button>
+                  <button
+                    onClick={() => moveCard(selectedGraveCard, 'graveyard', 'deckBottom')}
+                    className="py-2 bg-indigo-900 hover:bg-indigo-800 rounded-lg col-span-2"
+                  >
+                    山札の下へ
+                  </button>
+                </div>
               </div>
             )}
           </div>
         </div>
       )}
 
-      {/* ================= 相手（プレイヤー1）の墓地確認モーダル ================= */}
+      {/* ================= 相手（プレイヤー1）の墓地確認モーダル（横並びカード表示） ================= */}
       {oppGraveViewOpen && opponent && (
         <div
           onClick={() => setOppGraveViewOpen(false)}
@@ -4140,15 +4827,15 @@ function BattleRoomContent() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="bg-slate-800 border border-rose-500/60 rounded-xl p-4 max-w-2xl w-full max-h-[85vh] flex flex-col space-y-3"
+            className="bg-slate-900 border border-rose-500/60 rounded-2xl p-4 max-w-3xl w-full max-h-[85vh] flex flex-col space-y-3"
           >
             <div className="flex justify-between items-center">
               <h3 className="font-bold text-sm text-rose-300">
-                {opponent.name}の墓地 ({oppGraveyard.length}枚)
+                {opponent.name}の墓地 ({oppGraveyard.length}枚) - タップで拡大
               </h3>
               <button
                 onClick={() => setOppGraveViewOpen(false)}
-                className="px-3 py-1 bg-slate-700 rounded text-xs"
+                className="px-3 py-1 bg-slate-700 rounded text-xs font-bold"
               >
                 閉じる
               </button>
@@ -4156,18 +4843,28 @@ function BattleRoomContent() {
             {oppGraveyard.length === 0 ? (
               <p className="text-xs text-slate-400 py-6 text-center">墓地にカードはありません</p>
             ) : (
-              <div className="overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="overflow-x-auto flex gap-2.5 py-2 items-center min-h-[120px]">
                 {oppGraveyard.map((c) => (
                   <div
                     key={c.instanceId}
                     onClick={() => setInspectCard({ card: c, ownerName: opponent.name })}
-                    className="p-2 bg-slate-900 border border-slate-700 hover:border-amber-400 rounded flex items-center gap-2 cursor-pointer"
+                    className="cursor-pointer bg-slate-800 border border-slate-700 hover:border-amber-400 rounded-xl p-1.5 flex flex-col items-center w-20 sm:w-24 shrink-0 transition"
                   >
-                    {c.imageUrl && (
+                    {c.imageUrl ? (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={c.imageUrl} alt={c.name} className="w-8 h-11 object-cover rounded shrink-0" />
+                      <img
+                        src={c.imageUrl}
+                        alt={c.name}
+                        className="w-16 h-24 object-cover rounded border border-slate-600"
+                      />
+                    ) : (
+                      <div className="w-16 h-24 bg-slate-700 rounded flex items-center justify-center text-[10px] font-bold text-center p-1">
+                        {c.name}
+                      </div>
                     )}
-                    <div className="font-bold text-xs truncate underline">{c.name}</div>
+                    <span className="text-[10px] font-bold truncate w-full text-center mt-1">
+                      {c.name}
+                    </span>
                   </div>
                 ))}
               </div>
