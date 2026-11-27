@@ -409,7 +409,7 @@ async function fetchRoomState(roomId: string): Promise<ExtendedRoom | null> {
   const { data, error } = await supabase
     .from('rooms')
     .select('*')
-    .eq('id', roomId)
+    .eq('room_id', roomId)
     .maybeSingle();
   if (error) {
     console.error('fetchRoomState error:', error);
@@ -422,14 +422,17 @@ async function fetchRoomState(roomId: string): Promise<ExtendedRoom | null> {
 async function saveRoomState(roomId: string, state: ExtendedRoom): Promise<void> {
   const { error } = await supabase
     .from('rooms')
-    .upsert({ id: roomId, state, updated_at: new Date().toISOString() });
+    .upsert(
+      { room_id: roomId, state, updated_at: new Date().toISOString() },
+      { onConflict: 'room_id' }
+    );
   if (error) {
     console.error('saveRoomState error:', error);
   }
 }
 
 async function deleteRoomRow(roomId: string): Promise<void> {
-  const { error } = await supabase.from('rooms').delete().eq('id', roomId);
+  const { error } = await supabase.from('rooms').delete().eq('room_id', roomId);
   if (error) {
     console.error('deleteRoomRow error:', error);
   }
