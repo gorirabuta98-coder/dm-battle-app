@@ -2348,8 +2348,8 @@ const handleAttackDeclare = async (
           card: cleanCard,
           subText:
             dest === 'battleZone'
-              ? '🔥 革命0トリガー発動！！バトルゾーンへ降臨！'
-              : '🔥 革命0トリガー呪文発動！！',
+              ? '🔥 革命0トリガー！！まだ終わってへんでぇ！'
+              : '🔥 革命0トリガー！！そこのお前気を抜くなよ',
         },
       }
     );
@@ -2811,9 +2811,9 @@ const handleAttackDeclare = async (
         }}
         title={
           !isSpectator && targetingAttacker && isOpponentZone && zone === 'battleZone'
-            ? `${card.name}（タップで攻撃対象）`
+            ? `${card.name}`
             : showFace
-            ? `${card.name}（タップで操作）`
+            ? `${card.name}`
             : '裏向きカード'
         }
         className={`relative select-none transition-all shrink-0 ${
@@ -3251,7 +3251,7 @@ const handleAttackDeclare = async (
             <div className="text-lg sm:text-2xl font-black">
               {turnBanner.isMyTurn
                 ? '⚡ あなたのターンに切り替わりました！'
-                : `🔄 ${turnBanner.turnPlayerName} のターンに切り替わりました`}
+                : `🔄 ${turnBanner.turnPlayerName} のターンに切り替わりまっちょ`}
             </div>
           </div>
         </div>
@@ -3303,7 +3303,7 @@ const handleAttackDeclare = async (
             title="1タップでSE1（se1.mp3）を鳴らす"
             className="px-2 py-1 bg-amber-600 hover:bg-amber-500 active:scale-95 text-white rounded text-[11px] font-extrabold border border-amber-300/60 transition whitespace-nowrap shrink-0"
           >
-            🔔 SE1
+            ノートリ
           </button>
 
           <button
@@ -3315,7 +3315,7 @@ const handleAttackDeclare = async (
             title="1タップでSE2（se2.mp3）を鳴らす"
             className="px-2 py-1 bg-orange-600 hover:bg-orange-500 active:scale-95 text-white rounded text-[11px] font-extrabold border border-orange-300/60 transition whitespace-nowrap shrink-0"
           >
-            📯 SE2
+            拍手喝采
           </button>
 
           <div className="flex items-center gap-1 bg-slate-800 border border-slate-600 rounded px-1.5 py-0.5 shrink-0">
@@ -3333,7 +3333,7 @@ const handleAttackDeclare = async (
               title="BGM選択（選ぶと相手の画面にも流れます）"
             >
               <option value="off" className="bg-slate-900 text-slate-300">
-                🔇 BGM OFF
+                 BGM 一覧
               </option>
               {room.activeBgm && !myBgmList.some((t) => t.id === room.activeBgm?.id) && (
                 <option value="remote_playing" className="bg-slate-900 text-amber-300">
@@ -3474,7 +3474,7 @@ const handleAttackDeclare = async (
         <div className="my-1.5 p-3 bg-fuchsia-950/90 border-2 border-fuchsia-400 rounded-xl space-y-2 shadow-xl">
           <div className="flex items-center justify-between text-xs font-bold text-fuchsia-200">
             <span>
-              🃏 {activeOpponentHandReveal.playerName} が手札を公開中！（タップで拡大）
+              🃏 {activeOpponentHandReveal.playerName} が手札を公開中！
             </span>
             <span>{activeOpponentHandReveal.cards.length} 枚</span>
           </div>
@@ -3632,7 +3632,7 @@ const handleAttackDeclare = async (
       {amIWaitingDirectAttack && pendingDirectAttack && (
         <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-amber-400 rounded-xl flex items-center justify-between gap-2 text-xs font-bold text-amber-200 animate-pulse">
           <span>
-            ⚔️ 「{pendingDirectAttack.card.name}」でダイレクトアタック宣言中！相手の対応（敗北宣言 / 革命0トリガー / ブロック）を待っています...
+            ⚔️ 「{pendingDirectAttack.card.name}」勝てたら何食べたい？
           </span>
           <button
             type="button"
@@ -3659,7 +3659,7 @@ const handleAttackDeclare = async (
         <div className="my-1.5 p-3 bg-amber-950/90 border-2 border-amber-400 rounded-xl space-y-2 shadow-xl">
           <div className="flex items-center justify-between text-xs font-bold text-amber-300">
             <span>
-              👁️ {activePublicReveal.playerName} が山札の上からめくって公開中（タップで能力拡大）
+              👁️ {activePublicReveal.playerName} が山札の上からめくって公開中
             </span>
             <span>残り {activePublicReveal.cards.length} 枚</span>
           </div>
@@ -3746,7 +3746,7 @@ const handleAttackDeclare = async (
         <div className="flex items-center justify-between gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded">
           <div className="flex flex-wrap gap-2 items-center flex-1">
             <span className="text-[10px] text-slate-400 mr-1">
-              バトルゾーン (タップで拡大):
+              バトルゾーン :
             </span>
             {oppNormalBattleZone.map((c) =>
               renderCard(c, 'battleZone', false, opponent?.name || '相手')
@@ -3931,7 +3931,7 @@ const handleAttackDeclare = async (
           <div className="flex flex-wrap gap-1.5 items-center">
             <span className="text-[10px] text-lime-400 font-bold mr-1">
               マナ (使用可能 {untappedManaCount} / 合計 {mana.length})
-              {!isSpectator && ' ※タップで寝かせる'}:
+              {!isSpectator && ' 真剣にやれ'}:
             </span>
             {mana.map((c) => renderCard(c, 'mana', !isSpectator, me?.name || '自分'))}
           </div>
@@ -3949,7 +3949,7 @@ const handleAttackDeclare = async (
           <div className="text-[10px] text-slate-400 mb-1.5">
             {isSpectator
               ? `${me?.name || 'プレイヤー2'}の手札 (${hand.length}枚)`
-              : `自分の手札 (${hand.length}枚) - タップで超拡大＆マナ置き・召喚・進化・革命チェンジ`}
+              : `自分の手札 (${hand.length}枚) - ミスんなよぉ`}
           </div>
           <div className="flex flex-wrap gap-2 min-h-[90px]">
             {hand.map((c) =>
@@ -4468,7 +4468,7 @@ const handleAttackDeclare = async (
                 💥 ダイレクトアタックするクリーチャーを選択！
               </h3>
               <p className="text-xs text-slate-300">
-                選択すると相手の画面に「敗北を認める / 革命0トリガー / ブロック」の最終選択が出現します！
+                わんちゃん勝てるかもなぁ、どう？嬉しいやろ？嬉しいくせに
               </p>
             </div>
 
@@ -4660,7 +4660,7 @@ const handleAttackDeclare = async (
                   onClick={() => setInspectRotationDeg((prev) => (prev - 90) % 360)}
                   className="mt-2 px-3.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-500 text-xs font-extrabold text-slate-100 shadow active:scale-95 transition"
                 >
-                  🔄 表示を90°回転（反時計回り）
+                  🔄 表示を回転
                 </button>
               </div>
             ) : (
@@ -4714,11 +4714,11 @@ const handleAttackDeclare = async (
                     }`}
                   >
                     {inspectCard.card.ignored
-                      ? '☀️ 元の明るさに戻す（行動不能・無視を解除）'
-                      : '🌑 暗くする（行動不能・無視する目印）'}
+                      ? '☀️ 元の明るさに戻す'
+                      : '🌑 暗くする'}
                   </button>
 
-                  {/* 🎯 このクリーチャーを選択（山札・墓地・手札・マナ・シールド） */}
+                  {/* 🎯 このクリーチャーを選択 */}
                   <div className="w-full space-y-2">
                     <button
                       type="button"
@@ -4788,7 +4788,7 @@ const handleAttackDeclare = async (
                     : '🔒 山札の上からめくったカード（あなただけ見えています）'}
                 </h3>
                 <p className="text-xs text-slate-400">
-                  手札に加える・場に出す・マナや墓地に置くカードを選び、残りを山札の下（または上）に戻してください
+                  全力で楽しめよぉ
                 </p>
               </div>
               {!peekState.isPublic && me && (
@@ -5078,7 +5078,7 @@ const handleAttackDeclare = async (
                     }}
                     className="py-2 bg-purple-600 hover:bg-purple-500 rounded"
                   >
-                    🧬 進化（下敷き自由選択）
+                    🧬 進化
                   </button>
                   <button
                     onClick={() => {
@@ -5315,7 +5315,7 @@ const handleAttackDeclare = async (
                       onClick={() => moveCard(selectedCard.card, selectedCard.zone, 'shields')}
                       className="py-2 bg-amber-800 hover:bg-amber-700 rounded"
                     >
-                      シールドへ(裏)
+                      シールドへ(裏向き)
                     </button>
                   )}
                   <button
@@ -5611,7 +5611,7 @@ const handleAttackDeclare = async (
         </div>
       )}
 
-      {/* ================= 自分の墓地（手札・マナ風横並び＋タップで即拡大＆移動ボタン） ================= */}
+      {/* ================= 自分の墓地 ================= */}
       {graveSearchOpen && (
         <div
           onClick={() => {
@@ -5630,7 +5630,7 @@ const handleAttackDeclare = async (
                   {me?.name || '自分'}の墓地 ({graveyard.length}枚)
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  カードをタップすると大きく拡大表示され、山札やマナなどへ送るボタンが出ます
+                  墓地の画質悪くてごめんやでぃ
                 </p>
               </div>
               <button
@@ -5712,7 +5712,7 @@ const handleAttackDeclare = async (
                       選択中：「{selectedGraveCard.name}」
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      タップで大きく表示中。移動先ボタンを押すとそのゾーンへ送ります。
+                      
                     </p>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 text-xs font-bold">
                       <button
@@ -5788,7 +5788,7 @@ const handleAttackDeclare = async (
           >
             <div className="flex justify-between items-center">
               <h3 className="font-bold text-sm text-rose-300">
-                {opponent.name}の墓地 ({oppGraveyard.length}枚) - タップで拡大
+                {opponent.name}の墓地 ({oppGraveyard.length}枚) 
               </h3>
               <button
                 onClick={() => setOppGraveViewOpen(false)}
