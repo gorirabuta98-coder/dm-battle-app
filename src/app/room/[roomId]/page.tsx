@@ -23,6 +23,8 @@ type SoundEventType =
   | 'd2Switch'
   | 'spell'
   | 'kindanRelease'
+  | 'okPikoon'
+  | 'targetSelect'
   | 'customSe1'
   | 'customSe2';
 
@@ -78,12 +80,22 @@ interface TurnBannerState {
   isMyTurn: boolean;
 }
 
+interface TargetZoneCutIn {
+  id: string;
+  fromPlayerName: string;
+  cardName: string;
+  imageUrl: string;
+  destinationLabel: string;
+  timestamp: number;
+}
+
 type ExtendedRoom = GameRoom & {
   pendingDirectAttack?: PendingDirectAttack | null;
   attackTarget?: ActiveAttackTarget | null;
   soundEvent?: { id: string; type: SoundEventType; timestamp: number } | null;
   inspectingText?: string | null;
   cutIn?: CutInEvent | null;
+  targetZoneCutIn?: TargetZoneCutIn | null;
   publicReveal?: {
     playerName: string;
     cards: BattleCardInstance[];
@@ -113,19 +125,23 @@ const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
   spell: ['/sounds/spell.mp3', '/sounds/魔法陣を展開.mp3', '/sounds/魔法陣を展開.mp3.mp3'],
   kindanRelease: ['/sounds/kindan.mp3', '/sounds/地響き.mp3', '/sounds/地響き.mp3.mp3'],
   attack: ['/sounds/attack.mp3', '/sounds/大パンチ.mp3', '/sounds/大パンチ.mp3.mp3'],
-  // ↓ 自由に鳴らせるボタン用（public/sounds/ に se1.mp3 / se2.mp3 を置けばそのまま鳴る）
   customSe1: ['/sounds/se1.mp3', '/sounds/shot.mp3'],
   customSe2: ['/sounds/se2.mp3', '/sounds/cannon.mp3'],
 };
 
 const QUICK_SOUND_BUTTONS: { label: string; sound: SoundEventType }[] = [
+  { label: '💡 ピコーン！(OK)', sound: 'okPikoon' },
   { label: '💥 ビーム', sound: 'ability' },
   { label: '💣 大砲', sound: 'evolve' },
   { label: '🛡️ ブロック', sound: 'block' },
   { label: '🔥 革命0', sound: 'revZeroTrigger' },
   { label: '🌀 D2スイッチ', sound: 'd2Switch' },
-  { label: '🔔 効果音1', sound: 'customSe1' },
-  { label: '📯 効果音2', sound: 'customSe2' },
+];
+
+const BGM_TRACKS: { id: string; label: string; src: string }[] = [
+  { id: 'off', label: '🔇 BGM OFF', src: '' },
+  { id: 'bgm1', label: '🎵 通常バトル', src: '/sounds/bgm1.mp3' },
+  { id: 'bgm2', label: '🔥 切り札・決戦', src: '/sounds/bgm2.mp3' },
 ];
 
 function playSynthFallback(type: SoundEventType) {
@@ -158,22 +174,35 @@ function playSynthFallback(type: SoundEventType) {
         osc.start(now + idx * 0.11);
         osc.stop(now + idx * 0.11 + 0.4);
       });
-    } else if (type === 'block') {
-      [320, 640, 1280].forEach((freq, idx) => {
+    } else if (type === 'okPikoon') {
+      [659.25, 987.77].forEach((freq, idx) => {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-        osc.type = idx === 0 ? 'square' : 'triangle';
-        osc.frequency.setValueAtTime(freq, now);
-        osc.frequency.exponentialRampToValueAtTime(freq * 0.85, now + 0.35);
-
-        gain.gain.setValueAtTime(0.18, now);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
-
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.08);
+        gain.gain.setValueAtTime(0.001, now + idx * 0.08);
+        gain.gain.exponentialRampToValueAtTime(0.28, now + idx * 0.08 + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.08 + 0.35);
         osc.connect(gain);
         gain.connect(ctx.destination);
-        osc.start(now);
-        osc.stop(now + 0.4);
+        osc.start(now + idx * 0.08);
+        osc.stop(now + idx * 0.08 + 0.36);
       });
+    } else if (type === 'targetSelect') {
+      [880, 1174.66].forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.06);
+        gain.gain.setValueAtTime(0.001, now + idx * 0.06);
+        gain.gain.exponentialRampToValueAtTime(0.25, now + idx * 0.06 + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.06 + 0.25);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + idx * 0.06);
+        osc.stop(now + idx * 0.06 + 0.26);
+      });
+    } else if (type === 'block') {
     } else {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -452,7 +481,50 @@ function BattleRoomContent() {
   const [soundBoardOpen, setSoundBoardOpen] = useState<boolean>(false);
   const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
-  const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false);
+const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false);
+
+  // モーダル内の表示回転角度（反時計回りに -90° ずつ）
+  const [inspectRotationDeg, setInspectRotationDeg] = useState<number>(0);
+  const [selectedRotationDeg, setSelectedRotationDeg] = useState<number>(0);
+
+  // 相手クリーチャータップ時の「このクリーチャーを選択」枝分かれメニュー開閉
+  const [showTargetMoveMenu, setShowTargetMoveMenu] = useState<boolean>(false);
+
+  // 相手から指定されたカードの大きなカットイン通知
+  const [activeTargetZoneCutIn, setActiveTargetZoneCutIn] = useState<TargetZoneCutIn | null>(null);
+  const prevTargetZoneCutInIdRef = useRef<string | null>(null);
+
+  // BGM管理
+  const [bgmTrackId, setBgmTrackId] = useState<string>('off');
+  const [bgmVolume, setBgmVolume] = useState<number>(0.25);
+  const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const track = BGM_TRACKS.find((t) => t.id === bgmTrackId);
+    if (!track || !track.src) {
+      if (bgmAudioRef.current) {
+        bgmAudioRef.current.pause();
+        bgmAudioRef.current = null;
+      }
+      return;
+    }
+    const audio = new Audio(track.src);
+    audio.loop = true;
+    audio.volume = bgmVolume;
+    audio.play().catch(() => {});
+    bgmAudioRef.current = audio;
+
+    return () => {
+      audio.pause();
+      audio.src = '';
+    };
+  }, [bgmTrackId]);
+
+  useEffect(() => {
+    if (bgmAudioRef.current) {
+      bgmAudioRef.current.volume = bgmVolume;
+    }
+  }, [bgmVolume]);
 
   // ターン切り替わり視覚バナー
   const [turnBanner, setTurnBanner] = useState<TurnBannerState | null>(null);
@@ -548,6 +620,29 @@ function BattleRoomContent() {
   } | null>(null);
 
   const [resetting, setResetting] = useState(false);
+
+  useEffect(() => {
+    setInspectRotationDeg(0);
+    setShowTargetMoveMenu(false);
+  }, [inspectCard]);
+
+  useEffect(() => {
+    setSelectedRotationDeg(0);
+  }, [selectedCard]);
+
+  useEffect(() => {
+    const cutin = room?.targetZoneCutIn;
+    if (!cutin || !cutin.id || cutin.id === prevTargetZoneCutInIdRef.current) return;
+    const isInitial = prevTargetZoneCutInIdRef.current === null;
+    prevTargetZoneCutInIdRef.current = cutin.id;
+    if (isInitial && Date.now() - cutin.timestamp > 4000) return;
+
+    setActiveTargetZoneCutIn(cutin);
+    const timer = setTimeout(() => {
+      setActiveTargetZoneCutIn(null);
+    }, 4500);
+    return () => clearTimeout(timer);
+  }, [room?.targetZoneCutIn]);
 
   const triggerTurnBanner = useCallback((data: ExtendedRoom) => {
     const pid = myPlayerIdRef.current;
@@ -1239,74 +1334,37 @@ const isTargetOfAttack = (
     }
   };
 
-  const handleSendOpponentCardToFaceUpShield = async (
+  const handleAnnounceOpponentCreatureTarget = async (
     targetCard: BattleCardInstance,
-    sourceZone: ZoneType
+    destinationLabel: string
   ) => {
-    if (!opponent || !topPlayerId || isSpectator) return;
+    if (!me || isSpectator) return;
+    const displayImg =
+      targetCard.kindanRole && targetCard.kindanAwakened && targetCard.kindanAwakenedImageUrl
+        ? targetCard.kindanAwakenedImageUrl
+        : targetCard.imageUrl || '';
 
-    const removeFrom = (list: BattleCardInstance[]) =>
-      list.filter((c) => c.instanceId !== targetCard.instanceId);
-
-    let nextOppBZ = [...((opponent.battleZone || []) as BattleCardInstance[])];
-    let nextOppMana = [...((opponent.mana || []) as BattleCardInstance[])];
-    let nextOppGrave = [...((opponent.graveyard || []) as BattleCardInstance[])];
-    let nextOppShields = [...((opponent.shields || []) as BattleCardInstance[])];
-
-    if (sourceZone === 'battleZone') nextOppBZ = removeFrom(nextOppBZ);
-    if (sourceZone === 'mana') nextOppMana = removeFrom(nextOppMana);
-    if (sourceZone === 'graveyard') nextOppGrave = removeFrom(nextOppGrave);
-    if (sourceZone === 'shields') nextOppShields = removeFrom(nextOppShields);
-
-    if (targetCard.underCards && targetCard.underCards.length > 0) {
-      const freedUnder = targetCard.underCards.map((u) => ({
-        ...u,
-        tapped: false,
-        faceUp: true,
-        underCards: [],
-        ignored: false,
-      }));
-      nextOppGrave.push(...freedUnder);
-    }
-
-    const targetSlot = getNextEmptyOrNewSlot(nextOppShields);
-    const faceUpShieldCard: BattleCardInstance = {
-      ...targetCard,
-      tapped: false,
-      faceUp: true,
-      underCards: [],
-      ignored: false,
-      shieldOverlaySlot: targetSlot,
+    const payload: TargetZoneCutIn = {
+      id: `tz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      fromPlayerName: me.name || '相手プレイヤー',
+      cardName: targetCard.name,
+      imageUrl: displayImg,
+      destinationLabel,
+      timestamp: Date.now(),
     };
-    nextOppShields.push(faceUpShieldCard);
 
+    prevTargetZoneCutInIdRef.current = payload.id;
+    setActiveTargetZoneCutIn(payload);
+    setShowTargetMoveMenu(false);
     setInspectCard(null);
+
     await applyRoomUpdate(
-      (cur) => {
-        const curPlayers = cur.players || {};
-        const curOpp = curPlayers[topPlayerId] || opponent;
-        return {
-          ...cur,
-          players: {
-            ...curPlayers,
-            [topPlayerId]: {
-              ...curOpp,
-              battleZone: nextOppBZ,
-              mana: nextOppMana,
-              graveyard: nextOppGrave,
-              shields: nextOppShields,
-            },
-          },
-        };
-      },
-      {
-        cutIn: {
-          type: 'ability',
-          playerName: me?.name || 'プレイヤー',
-          card: faceUpShieldCard,
-          subText: `${opponent.name} の ${targetSlot} に表向きシールドとして追加！`,
-        },
-      }
+      (cur) => ({
+        ...cur,
+        targetZoneCutIn: payload,
+      }),
+      { sound: 'targetSelect' },
+      true
     );
   };
 
@@ -2575,7 +2633,16 @@ const isTargetOfAttack = (
     const underCount = card.underCards?.length || 0;
     const canClick = isControllable || showFace;
     const isKindan = !!card.kindanRole;
+    const isD2 = zone === 'battleZone' && isD2FieldCard(card);
     const isIgnored = zone === 'battleZone' && !!card.ignored;
+
+    const rotationClass = isD2
+      ? card.d2Switched
+        ? 'rotate-90 mx-2.5'
+        : '-rotate-90 mx-2.5'
+      : card.tapped
+      ? 'rotate-90 mx-2.5 opacity-85'
+      : '';
 
     const isOpponentZone = !isControllable && !isSpectator;
     const isPickedInTargetingMode =
@@ -2651,7 +2718,7 @@ const isTargetOfAttack = (
           canClick || (!isSpectator && targetingAttacker && isOpponentZone && zone === 'battleZone')
             ? 'cursor-pointer active:scale-95'
             : 'cursor-default'
-        } ${card.tapped ? 'rotate-90 mx-2.5 opacity-85' : ''} ${
+        } ${rotationClass} ${
           isIgnored ? 'brightness-50 saturate-50' : ''
         } ${
           isGlowingTarget
@@ -3020,6 +3087,52 @@ const isTargetOfAttack = (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between p-2 sm:p-4 max-w-6xl mx-auto">
       <CutInOverlay event={room.cutIn} />
 
+      {/* 相手クリーチャー対象指定カットイン（タップ時と同じ特大サイズで表示） */}
+      {activeTargetZoneCutIn && (
+        <div
+          onClick={() => setActiveTargetZoneCutIn(null)}
+          className="fixed inset-0 bg-black/80 flex items-center justify-center p-3 sm:p-4 z-[60] cursor-pointer"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-amber-400 rounded-2xl p-4 max-w-md w-full flex flex-col items-center text-center space-y-3 shadow-[0_0_40px_rgba(251,191,36,0.55)] cursor-default"
+          >
+            <span className="px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400 text-amber-300 text-xs font-extrabold">
+              🎯 {activeTargetZoneCutIn.fromPlayerName} がクリーチャーを指定！
+            </span>
+
+            {activeTargetZoneCutIn.imageUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={activeTargetZoneCutIn.imageUrl}
+                alt={activeTargetZoneCutIn.cardName}
+                className="w-[80vw] max-w-[350px] h-[54vh] max-h-[480px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl"
+              />
+            ) : (
+              <div className="w-64 h-80 bg-slate-800 rounded-xl flex items-center justify-center font-extrabold text-lg p-4">
+                {activeTargetZoneCutIn.cardName}
+              </div>
+            )}
+
+            <div className="font-extrabold text-base text-white">
+              {activeTargetZoneCutIn.cardName}
+            </div>
+
+            <div className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-rose-600 text-slate-950 font-black text-base sm:text-lg shadow-lg">
+              ➡ 「{activeTargetZoneCutIn.destinationLabel}」送りに指定！
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setActiveTargetZoneCutIn(null)}
+              className="w-full py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-xs font-bold"
+            >
+              確認して閉じる
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ターン切り替わり視覚バナー */}
       {turnBanner && (
         <div className="fixed inset-x-0 top-20 flex justify-center z-50 pointer-events-none px-4">
@@ -3095,6 +3208,69 @@ const isTargetOfAttack = (
           >
             {soundEnabled ? '🔊 音ON' : '🔇 音OFF'}
           </button>
+
+          <button
+            type="button"
+            onClick={async () => {
+              if (soundEnabledRef.current) playGameSound('customSe1');
+              await applyRoomUpdate((cur) => cur, { sound: 'customSe1' }, true);
+            }}
+            title="1タップでSE1（se1.mp3）を鳴らす"
+            className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 active:scale-95 text-white rounded text-xs font-extrabold border border-amber-300/60 transition"
+          >
+            🔔 SE1
+          </button>
+
+          <button
+            type="button"
+            onClick={async () => {
+              if (soundEnabledRef.current) playGameSound('customSe2');
+              await applyRoomUpdate((cur) => cur, { sound: 'customSe2' }, true);
+            }}
+            title="1タップでSE2（se2.mp3）を鳴らす"
+            className="px-2.5 py-1.5 bg-orange-600 hover:bg-orange-500 active:scale-95 text-white rounded text-xs font-extrabold border border-orange-300/60 transition"
+          >
+            📯 SE2
+          </button>
+
+          <button
+            type="button"
+            onClick={async () => {
+              if (soundEnabledRef.current) playGameSound('okPikoon');
+              await applyRoomUpdate((cur) => cur, { sound: 'okPikoon' }, true);
+            }}
+            title="相手に合図音（ピコーン！）を送る"
+            className="px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 active:scale-95 text-white rounded text-xs font-extrabold border border-sky-300/60 transition"
+          >
+            💡 ピコーン
+          </button>
+
+          <div className="flex items-center gap-1 bg-slate-800 border border-slate-600 rounded px-2 py-1">
+            <select
+              value={bgmTrackId}
+              onChange={(e) => setBgmTrackId(e.target.value)}
+              className="bg-transparent text-xs font-bold text-slate-100 focus:outline-none cursor-pointer"
+              title="BGM選択（ループ再生）"
+            >
+              {BGM_TRACKS.map((t) => (
+                <option key={t.id} value={t.id} className="bg-slate-900 text-white">
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            {bgmTrackId !== 'off' && (
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={bgmVolume}
+                onChange={(e) => setBgmVolume(Number(e.target.value))}
+                className="w-12 accent-emerald-400 cursor-pointer"
+                title="BGM音量"
+              />
+            )}
+          </div>
 
           <div className="relative">
             <button
@@ -4348,7 +4524,6 @@ const isTargetOfAttack = (
         </div>
       )}
 
-      {/* ================= 相手のカード（または観戦中のカード）超拡大プレビュー ================= */}
       {inspectCard && (
         <div
           onClick={() => setInspectCard(null)}
@@ -4370,19 +4545,36 @@ const isTargetOfAttack = (
             inspectCard.card.kindanAwakenedImageUrl
               ? inspectCard.card.kindanAwakenedImageUrl
               : inspectCard.card.imageUrl) ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={
-                  inspectCard.card.kindanRole &&
-                  inspectCard.card.kindanAwakened &&
-                  inspectCard.card.kindanAwakenedImageUrl
-                    ? inspectCard.card.kindanAwakenedImageUrl
-                    : inspectCard.card.imageUrl
-                }
-                alt={inspectCard.card.name}
-                onClick={() => setInspectCard(null)}
-                className="w-[80vw] max-w-[360px] h-[56vh] max-h-[500px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl cursor-pointer"
-              />
+              <div className="flex flex-col items-center w-full">
+                <div
+                  className="transition-transform duration-200 flex items-center justify-center"
+                  style={{
+                    transform: `rotate(${inspectRotationDeg}deg)`,
+                    margin: Math.abs(inspectRotationDeg) % 180 === 90 ? '36px 0' : '0',
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={
+                      inspectCard.card.kindanRole &&
+                      inspectCard.card.kindanAwakened &&
+                      inspectCard.card.kindanAwakenedImageUrl
+                        ? inspectCard.card.kindanAwakenedImageUrl
+                        : inspectCard.card.imageUrl
+                    }
+                    alt={inspectCard.card.name}
+                    onClick={() => setInspectCard(null)}
+                    className="w-[80vw] max-w-[340px] h-[50vh] max-h-[440px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-2xl cursor-pointer"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setInspectRotationDeg((prev) => (prev - 90) % 360)}
+                  className="mt-2 px-3.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-500 text-xs font-extrabold text-slate-100 shadow active:scale-95 transition"
+                >
+                  🔄 表示を90°回転（反時計回り）
+                </button>
+              </div>
             ) : (
               <div className="w-full p-4 bg-slate-800 rounded-xl space-y-2 text-center">
                 <div className="font-extrabold text-base text-amber-300">
@@ -4424,35 +4616,58 @@ const isTargetOfAttack = (
             {!isSpectator &&
               inspectCard.isOpponentCard &&
               inspectCard.sourceZone === 'battleZone' && (
-                <button
-                  onClick={() => handleToggleOpponentIgnore(inspectCard.card)}
-                  className={`w-full py-2.5 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition ${
-                    inspectCard.card.ignored
-                      ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
-                      : 'bg-slate-700 hover:bg-slate-600 border border-slate-400 text-white'
-                  }`}
-                >
-                  {inspectCard.card.ignored
-                    ? '☀️ 元の明るさに戻す（行動不能・無視を解除）'
-                    : '🌑 暗くする（行動不能・無視する目印）'}
-                </button>
-              )}
+                <>
+                  <button
+                    onClick={() => handleToggleOpponentIgnore(inspectCard.card)}
+                    className={`w-full py-2.5 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition ${
+                      inspectCard.card.ignored
+                        ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
+                        : 'bg-slate-700 hover:bg-slate-600 border border-slate-400 text-white'
+                    }`}
+                  >
+                    {inspectCard.card.ignored
+                      ? '☀️ 元の明るさに戻す（行動不能・無視を解除）'
+                      : '🌑 暗くする（行動不能・無視する目印）'}
+                  </button>
 
-            {!isSpectator &&
-              inspectCard.isOpponentCard &&
-              !inspectCard.card.kindanRole &&
-              (inspectCard.sourceZone === 'battleZone' || inspectCard.sourceZone === 'mana') && (
-                <button
-                  onClick={() =>
-                    handleSendOpponentCardToFaceUpShield(
-                      inspectCard.card,
-                      inspectCard.sourceZone!
-                    )
-                  }
-                  className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition"
-                >
-                  🛡️ 表向きにして相手のシールドに追加（新シールド）
-                </button>
+                  {/* 🎯 このクリーチャーを選択（山札・墓地・手札・マナ・シールド） */}
+                  <div className="w-full space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowTargetMoveMenu((prev) => !prev)}
+                      className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-xl text-xs sm:text-sm shadow-lg transition"
+                    >
+                      🎯 このクリーチャーを選択 {showTargetMoveMenu ? '▲' : '▼'}
+                    </button>
+
+                    {showTargetMoveMenu && (
+                      <div className="grid grid-cols-5 gap-1.5 p-2 rounded-xl bg-slate-800 border border-amber-400/70">
+                        {[
+                          { label: '山札', icon: '📚' },
+                          { label: '墓地', icon: '🪦' },
+                          { label: '手札', icon: '✋' },
+                          { label: 'マナ', icon: '💎' },
+                          { label: 'シールド', icon: '🛡️' },
+                        ].map((dest) => (
+                          <button
+                            key={dest.label}
+                            type="button"
+                            onClick={() =>
+                              handleAnnounceOpponentCreatureTarget(
+                                inspectCard.card,
+                                dest.label
+                              )
+                            }
+                            className="py-2 px-1 bg-slate-700 hover:bg-amber-500 hover:text-slate-950 text-white rounded-lg text-[11px] font-extrabold flex flex-col items-center gap-0.5 transition active:scale-95"
+                          >
+                            <span>{dest.icon}</span>
+                            <span>{dest.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
 
             <button
@@ -4602,19 +4817,34 @@ const isTargetOfAttack = (
             selectedCard.card.kindanAwakenedImageUrl
               ? selectedCard.card.kindanAwakenedImageUrl
               : selectedCard.card.imageUrl) && (
-              <div className="flex justify-center">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={
-                    selectedCard.card.kindanRole &&
-                    selectedCard.card.kindanAwakened &&
-                    selectedCard.card.kindanAwakenedImageUrl
-                      ? selectedCard.card.kindanAwakenedImageUrl
-                      : selectedCard.card.imageUrl
-                  }
-                  alt={selectedCard.card.name}
-                  className="w-[78vw] max-w-[350px] h-[46vh] max-h-[420px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-xl"
-                />
+              <div className="flex flex-col items-center">
+                <div
+                  className="transition-transform duration-200 flex items-center justify-center"
+                  style={{
+                    transform: `rotate(${selectedRotationDeg}deg)`,
+                    margin: Math.abs(selectedRotationDeg) % 180 === 90 ? '32px 0' : '0',
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={
+                      selectedCard.card.kindanRole &&
+                      selectedCard.card.kindanAwakened &&
+                      selectedCard.card.kindanAwakenedImageUrl
+                        ? selectedCard.card.kindanAwakenedImageUrl
+                        : selectedCard.card.imageUrl
+                    }
+                    alt={selectedCard.card.name}
+                    className="w-[78vw] max-w-[330px] h-[44vh] max-h-[400px] object-contain rounded-xl border border-slate-600 bg-slate-950 shadow-xl"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedRotationDeg((prev) => (prev - 90) % 360)}
+                  className="mt-2 px-3.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 border border-slate-500 text-xs font-extrabold text-slate-100 shadow active:scale-95 transition"
+                >
+                  🔄 表示を90°回転（反時計回り）
+                </button>
               </div>
             )}
 
