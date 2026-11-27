@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 
 export interface CutInEvent {
   id: string;
@@ -117,56 +117,6 @@ export default function CutInOverlay({ event }: CutInOverlayProps) {
         >
           閉じる（タップでも閉じます）
         </button>
-      </div>
-    </div>
-  );
-}
-
-export interface VideoCutInData {
-  id: string;
-  videoUrl: string;
-  title?: string;
-  /** 黒背景を透かして光るエフェクトだけ重ねたい場合は true、そのまま全画面枠で出す場合は false */
-  transparentBlack?: boolean;
-}
-
-export function DirectAttackVideoOverlay({
-  data,
-  onComplete,
-}: {
-  data: VideoCutInData | null;
-  onComplete: () => void;
-}) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-
-  useEffect(() => {
-    if (!data || !videoRef.current) return;
-    const v = videoRef.current;
-    v.currentTime = 0;
-    v.play().catch(() => {
-      // 自動再生ブロック対策：ミュートで再試行
-      v.muted = true;
-      v.play().catch(() => {});
-    });
-  }, [data]);
-
-  if (!data) return null;
-
-  return (
-    <div
-      onClick={onComplete}
-      className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-auto bg-black/50 animate-fadeIn"
-    >
-      <div className="relative w-[92vw] max-w-3xl aspect-video rounded-2xl overflow-hidden shadow-[0_0_60px_rgba(255,215,0,0.85)] border-4 border-amber-400 bg-black">
-        <video
-          ref={videoRef}
-          src={data.videoUrl}
-          playsInline
-          onEnded={onComplete}
-          className={`w-full h-full object-contain ${
-            data.transparentBlack ? 'mix-blend-screen' : ''
-          }`}
-        />
       </div>
     </div>
   );

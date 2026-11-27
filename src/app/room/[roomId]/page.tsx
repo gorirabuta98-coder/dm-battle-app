@@ -7,7 +7,6 @@ import { fetchCustomDeckById } from '@/lib/supabaseDecks';
 import { uploadCardImageToSupabase } from '@/lib/supabaseStorage';
 import { CardData, CardInstance, GameRoom, KindanType, PlayerState } from '@/types/game';
 import CutInOverlay, { CutInEvent } from '@/components/CutInOverlay';
-import { DirectAttackVideoOverlay, VideoCutInData } from '@/components/CutInOverlay';
 
 type ZoneType = 'hand' | 'mana' | 'battleZone' | 'shields' | 'graveyard';
 type EvolutionSourceZone = 'battleZone' | 'mana' | 'graveyard' | 'hand' | 'deck';
@@ -693,17 +692,6 @@ const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false)
   } | null>(null);
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [deckSearchOpen, setDeckSearchOpen] = useState(false);
-  const [activeVideoCutIn, setActiveVideoCutIn] = useState<VideoCutInData | null>(null);
-  const lastPlayedVideoCutInIdRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const cutIn = (room as any)?.latestVideoCutIn as VideoCutInData | undefined;
-    if (!cutIn || !cutIn.id) return;
-    if (lastPlayedVideoCutInIdRef.current === cutIn.id) return;
-
-    lastPlayedVideoCutInIdRef.current = cutIn.id;
-    setActiveVideoCutIn(cutIn);
-  }, [(room as any)?.latestVideoCutIn]);
   const [graveSearchOpen, setGraveSearchOpen] = useState(false);
   const [oppGraveViewOpen, setOppGraveViewOpen] = useState(false);
   const [peekCount, setPeekCount] = useState<number>(4);
@@ -3392,25 +3380,13 @@ const handleAttackDeclare = async (
                 🃏 手札見せる
               </button>
               <button
-                type="button"
-                onClick={async () => {
-                  setDirectAttackModalOpen(true);
-                  const videoPayload: VideoCutInData = {
-                    id: `da_${Date.now()}`,
-                    videoUrl: '/effects/direct-attack.mp4',
-                    transparentBlack: false,
-                  };
-                  lastPlayedVideoCutInIdRef.current = videoPayload.id;
-                  setActiveVideoCutIn(videoPayload);
-                  await applyRoomUpdate((cur) => cur, {
-                    latestVideoCutIn: videoPayload,
-                  } as any);
-                }}
-                title="ダイレクトアタック"
-                className="px-2 py-1 bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white border border-yellow-300/80 rounded text-[11px] font-extrabold shadow-md animate-pulse whitespace-nowrap shrink-0"
-              >
-                💥 DA
-              </button>
+             type="button"
+             onClick={() => setDirectAttackModalOpen(true)}
+             title="ダイレクトアタック"
+             className="px-2 py-1 bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white border border-yellow-300/80 rounded text-[11px] font-extrabold shadow-md animate-pulse whitespace-nowrap shrink-0"
+           >
+             💥 DA
+           </button>
               <button
                 onClick={handleUndo}
                 disabled={undoStack.length === 0}
@@ -5794,11 +5770,7 @@ const handleAttackDeclare = async (
           </div>
         </div>
       )}
-      {/* ================= ダイレクトアタック動画カットイン ================= */}
-      <DirectAttackVideoOverlay
-        data={activeVideoCutIn}
-        onComplete={() => setActiveVideoCutIn(null)}
-      />
+      
 
       {/* ================= 相手（プレイヤー1）の墓地確認モーダル（横並びカード表示） ================= */}
       {oppGraveViewOpen && opponent && (
