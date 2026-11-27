@@ -3800,7 +3800,7 @@ const handleAttackDeclare = async (
                 {!isSpectator &&
                   (multiShieldSelectMode
                     ? ' ※複数選択中（タップでON/OFF）'
-                    : ' ※S1〜S5タップで確認・ブレイク選択')}
+                    : ' ')}
               </span>
               {!isSpectator && shields.length > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
