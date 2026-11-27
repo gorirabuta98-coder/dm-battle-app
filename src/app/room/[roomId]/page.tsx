@@ -537,8 +537,25 @@ const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false)
     }
 
     const audio = new Audio(activeBgm.url);
-    audio.loop = true;
+    audio.loop = false;
     audio.volume = bgmVolume;
+    audio.onended = () => {
+      bgmAudioRef.current = null;
+      currentPlayingBgmKeyRef.current = '';
+      if (!isSpectator) {
+        applyRoomUpdate(
+          (cur) => {
+            if (!cur.activeBgm) return cur;
+            return {
+              ...cur,
+              activeBgm: null,
+            };
+          },
+          undefined,
+          true
+        ).catch(() => {});
+      }
+    };
     audio.play().catch((err) => {
       console.warn('BGM再生待機（画面タップ後に再生されます）:', err);
     });
