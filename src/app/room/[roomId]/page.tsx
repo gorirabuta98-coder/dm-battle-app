@@ -984,11 +984,16 @@ const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false)
 const isTargetOfAttack = (
     cardInstanceId: string,
     zone: 'shields' | 'battleZone',
+    isTargetSideMine: boolean,
     slotName?: string
   ): boolean => {
     if (!activeAttackTarget) return false;
+    const expectedDefenderId = isTargetSideMine ? bottomPlayerId : topPlayerId;
+    if (!expectedDefenderId || activeAttackTarget.defenderPlayerId !== expectedDefenderId) {
+      return false;
+    }
     if (zone === 'shields') {
-      if (activeAttackTarget.shieldIds?.includes(cardInstanceId)) return true;
+      if (cardInstanceId && activeAttackTarget.shieldIds?.includes(cardInstanceId)) return true;
       if (slotName && activeAttackTarget.shieldSlots?.includes(slotName)) return true;
       return false;
     }
@@ -2062,7 +2067,7 @@ const isTargetOfAttack = (
     setSelectedCard(null);
   };
 
-  const handleAttackDeclare = async (
+const handleAttackDeclare = async (
     attacker: BattleCardInstance,
     targetOverride?: { shieldIds: string[]; creatureId: string | null }
   ) => {
@@ -2079,7 +2084,7 @@ const isTargetOfAttack = (
       ? oppBattleZone.find((c) => c.instanceId === creatureId)
       : undefined;
 
-   const shieldLabels = shieldIds
+    const shieldLabels = shieldIds
       .map((sid) => {
         const found = oppShields.find((s) => s.instanceId === sid);
         return found?.shieldOverlaySlot || null;
@@ -2109,8 +2114,11 @@ const isTargetOfAttack = (
           }
         : null;
 
+    // ※ cancelAttackTargeting() を呼ぶと DB の attackTarget: null と競合するため、ローカル選択状態だけリセット
     setSelectedCard(null);
-    cancelAttackTargeting();
+    setTargetingAttacker(null);
+    setSelectedTargetShieldIds([]);
+    setSelectedTargetCreatureId(null);
 
     const snapshot = JSON.stringify({
       deck: me.deck || [],
@@ -2747,7 +2755,7 @@ const isTargetOfAttack = (
       selectedTargetCreatureId === card.instanceId;
 
     const isHighlightedByRemoteAttack =
-      zone === 'battleZone' && isTargetOfAttack(card.instanceId, 'battleZone');
+      zone === 'battleZone' && isTargetOfAttack(card.instanceId, 'battleZone', isControllable);
 
     const isGlowingTarget = isPickedInTargetingMode || isHighlightedByRemoteAttack;
 
@@ -2958,8 +2966,8 @@ const isTargetOfAttack = (
             !isSpectator &&
             !!targetingAttacker &&
             allCardsInSlot.some((c) => selectedTargetShieldIds.includes(c.instanceId))) ||
-          allCardsInSlot.some((c) => isTargetOfAttack(c.instanceId, 'shields', slot)) ||
-          (isMine && isTargetOfAttack('', 'shields', slot));
+          allCardsInSlot.some((c) => isTargetOfAttack(c.instanceId, 'shields', isMine, slot)) ||
+          isTargetOfAttack('', 'shields', isMine, slot);
 
         const handleSlotClick = () => {
           if (isEmptySlot) return;
@@ -3542,6 +3550,42 @@ const isTargetOfAttack = (
           </div>
         </div>
       )}
+
+      {/* 自分が攻撃宣言した後の表示バナー（攻撃対象が光り続け、ボタンで解除可能） */}
+      {!isSpectator &&
+        !targetingAttacker &&
+        activeAttackTarget &&
+        !activeAttackTarget.isPreview &&
+        activeAttackTarget.attackerPlayerId === me?.id && (
+          <div className="my-1.5 p-2.5 bg-amber-950/95 border-2 border-amber-400 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-amber-100 shadow-lg">
+            <span>
+              ⚔️ 「{activeAttackTarget.attackerCardName}」で攻撃宣言中 → 対象：
+              <strong className="text-yellow-300 underline ml-1">
+                {activeAttackTarget.creatureId
+                  ? `相手クリーチャー「${
+                      opponent?.battleZone.find(
+                        (c) => c.instanceId === activeAttackTarget.creatureId
+                      )?.name || '対象クリーチャー'
+                    }」`
+                  : activeAttackTarget.shieldSlots && activeAttackTarget.shieldSlots.length > 0
+                  ? `相手シールド ${activeAttackTarget.shieldSlots.join('・')}`
+                  : '相手プレイヤー'}
+              </strong>
+            </span>
+            <button
+              type="button"
+              onClick={async () => {
+                await applyRoomUpdate((cur) => ({
+                  ...cur,
+                  attackTarget: null,
+                }));
+              }}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] text-slate-200 shrink-0"
+            >
+              攻撃表示を消す
+            </button>
+          </div>
+        )}
 
       {/* 相手から狙われている側への通知＋ブロッカー対応バナー */}
       {amIDefendingTargetedAttack && activeAttackTarget && (
