@@ -7,6 +7,7 @@ import { fetchCustomDecks, deleteCustomDeck } from '@/lib/supabaseDecks';
 import { uploadCardImageToSupabase } from '@/lib/supabaseStorage';
 import { DeckPreset } from '@/data/decks';
 import { CardData, CardInstance, GameRoom, KindanType } from '@/types/game';
+import CustomBgmManager from '@/components/CustomBgmManager';
 
 type KindanImageKey =
   | 'dokindamFront'
@@ -805,6 +806,9 @@ export default function HomePage() {
             )}
           </div>
         )}
+
+        {/* マイBGM登録パネル（誰でも好きな曲名で登録・試聴・削除可能） */}
+        <CustomBgmManager />
 
         {/* 部屋を作る（数字3桁ID） */}
         <div className="pt-2 border-t border-slate-700 space-y-3">

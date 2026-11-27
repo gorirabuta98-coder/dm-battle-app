@@ -93,6 +93,13 @@ type ExtendedRoom = GameRoom & {
   pendingDirectAttack?: PendingDirectAttack | null;
   attackTarget?: ActiveAttackTarget | null;
   soundEvent?: { id: string; type: SoundEventType; timestamp: number } | null;
+  activeBgm?: {
+    id: string;
+    name: string;
+    url: string;
+    startedBy: string;
+    timestamp: number;
+  } | null;
   inspectingText?: string | null;
   cutIn?: CutInEvent | null;
   targetZoneCutIn?: TargetZoneCutIn | null;
@@ -138,11 +145,7 @@ const QUICK_SOUND_BUTTONS: { label: string; sound: SoundEventType }[] = [
   { label: '🌀 D2スイッチ', sound: 'd2Switch' },
 ];
 
-const BGM_TRACKS: { id: string; label: string; src: string }[] = [
-  { id: 'off', label: '🔇 BGM OFF', src: '' },
-  { id: 'bgm1', label: '🎵 通常バトル', src: '/sounds/bgm1.mp3' },
-  { id: 'bgm2', label: '🔥 切り札・決戦', src: '/sounds/bgm2.mp3' },
-];
+
 
 function playSynthFallback(type: SoundEventType) {
   try {
@@ -494,37 +497,110 @@ const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false)
   const [activeTargetZoneCutIn, setActiveTargetZoneCutIn] = useState<TargetZoneCutIn | null>(null);
   const prevTargetZoneCutInIdRef = useRef<string | null>(null);
 
-  // BGM管理
-  const [bgmTrackId, setBgmTrackId] = useState<string>('off');
-  const [bgmVolume, setBgmVolume] = useState<number>(0.25);
+  // BGM管理（マイBGM選択 → 自分＆相手の画面でリアルタイム同期再生・停止）
+  const [myBgmList, setMyBgmList] = useState<{ id: string; name: string; url: string }[]>([]);
+  const [bgmVolume, setBgmVolume] = useState<number>(0.3);
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const currentPlayingBgmKeyRef = useRef<string>('');
 
   useEffect(() => {
-    const track = BGM_TRACKS.find((t) => t.id === bgmTrackId);
-    if (!track || !track.src) {
+    import('@/lib/customBgm')
+      .then(({ getMyCustomBgms }) => {
+        setMyBgmList(getMyCustomBgms());
+      })
+      .catch(() => {});
+  }, []);
+
+  // room.activeBgm の変化を監視して自分と相手のブラウザで自動再生＆停止
+  useEffect(() => {
+    const activeBgm = room?.activeBgm;
+
+    if (!activeBgm || !activeBgm.url) {
       if (bgmAudioRef.current) {
         bgmAudioRef.current.pause();
+        bgmAudioRef.current.src = '';
         bgmAudioRef.current = null;
       }
+      currentPlayingBgmKeyRef.current = '';
       return;
     }
-    const audio = new Audio(track.src);
+
+    const playKey = `${activeBgm.id}-${activeBgm.timestamp}`;
+    if (currentPlayingBgmKeyRef.current === playKey && bgmAudioRef.current) {
+      return;
+    }
+
+    if (bgmAudioRef.current) {
+      bgmAudioRef.current.pause();
+      bgmAudioRef.current.src = '';
+    }
+
+    const audio = new Audio(activeBgm.url);
     audio.loop = true;
     audio.volume = bgmVolume;
-    audio.play().catch(() => {});
-    bgmAudioRef.current = audio;
+    audio.play().catch((err) => {
+      console.warn('BGM再生待機（画面タップ後に再生されます）:', err);
+    });
 
-    return () => {
-      audio.pause();
-      audio.src = '';
-    };
-  }, [bgmTrackId]);
+    bgmAudioRef.current = audio;
+    currentPlayingBgmKeyRef.current = playKey;
+  }, [room?.activeBgm]);
 
   useEffect(() => {
     if (bgmAudioRef.current) {
       bgmAudioRef.current.volume = bgmVolume;
     }
   }, [bgmVolume]);
+
+  useEffect(() => {
+    return () => {
+      if (bgmAudioRef.current) {
+        bgmAudioRef.current.pause();
+        bgmAudioRef.current.src = '';
+        bgmAudioRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleSelectRoomBgm = async (selectedId: string) => {
+    if (isSpectator) return;
+
+    if (selectedId === 'off') {
+      if (bgmAudioRef.current) {
+        bgmAudioRef.current.pause();
+        bgmAudioRef.current.src = '';
+        bgmAudioRef.current = null;
+      }
+      currentPlayingBgmKeyRef.current = '';
+      await applyRoomUpdate(
+        (cur) => ({
+          ...cur,
+          activeBgm: null,
+        }),
+        undefined,
+        true
+      );
+      return;
+    }
+
+    const found = myBgmList.find((t) => t.id === selectedId);
+    if (!found) return;
+
+    await applyRoomUpdate(
+      (cur) => ({
+        ...cur,
+        activeBgm: {
+          id: found.id,
+          name: found.name,
+          url: found.url,
+          startedBy: me?.name || 'プレイヤー',
+          timestamp: Date.now(),
+        },
+      }),
+      undefined,
+      true
+    );
+  };
 
   // ターン切り替わり視覚バナー
   const [turnBanner, setTurnBanner] = useState<TurnBannerState | null>(null);
@@ -3156,59 +3232,42 @@ const isTargetOfAttack = (
       )}
 
       {/* 上部バー（スクロール時も固定） */}
-      <header className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-2 bg-slate-900/95 backdrop-blur-md p-2.5 rounded-lg border border-slate-700 shadow-lg">
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <span className="text-xs sm:text-sm bg-slate-800 px-2.5 py-1 rounded font-mono font-bold text-amber-400">
+      <header className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-1.5 bg-slate-900/95 backdrop-blur-md px-2.5 py-2 rounded-lg border border-slate-700 shadow-lg">
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-xs bg-slate-800 px-2 py-1 rounded font-mono font-bold text-amber-400">
             ID: {room.roomId}
           </span>
           {isSpectator && (
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs bg-indigo-600 px-2.5 py-1 rounded font-bold text-white">
-                👁️ 観戦モード
+            <div className="flex items-center gap-1">
+              <span className="text-xs bg-indigo-600 px-2 py-1 rounded font-bold text-white">
+                👁️ 観戦
               </span>
               <button
                 type="button"
                 onClick={() => setSpectatorShowHands((prev) => !prev)}
-                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 border border-amber-400/70 text-amber-300 rounded text-xs font-bold"
+                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-amber-400/70 text-amber-300 rounded text-xs font-bold"
               >
-                {spectatorShowHands ? '🙈 両方の手札を隠す' : '👁️ 両方の手札を見る'}
+                {spectatorShowHands ? '🙈 手札隠す' : '👁️ 手札見る'}
               </button>
             </div>
           )}
           <span
-            className={`text-xs sm:text-sm font-extrabold px-2.5 py-1 rounded border ${
+            className={`text-xs font-extrabold px-2 py-1 rounded border whitespace-nowrap ${
               isMyTurn
                 ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-300'
                 : 'bg-amber-950/60 border-amber-500/40 text-amber-300'
             }`}
           >
-            ターン {room.turnCount}：
+            T{room.turnCount}：
             {isSpectator
-              ? `${turnOwnerName}のターン`
+              ? `${turnOwnerName}`
               : isMyTurn
-              ? 'あなたのターン'
-              : `${opponent?.name || '相手'}のターン`}
+              ? '自分'
+              : `${opponent?.name || '相手'}`}
           </span>
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              const next = !soundEnabled;
-              setSoundEnabled(next);
-              if (next) playGameSound('turnEnd');
-            }}
-            title="効果音のON/OFF"
-            className={`px-2.5 py-1.5 rounded text-xs font-bold border transition ${
-              soundEnabled
-                ? 'bg-slate-800 hover:bg-slate-700 border-amber-400/60 text-amber-300'
-                : 'bg-slate-900 border-slate-700 text-slate-500'
-            }`}
-          >
-            {soundEnabled ? '🔊 音ON' : '🔇 音OFF'}
-          </button>
-
+        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
           <button
             type="button"
             onClick={async () => {
@@ -3216,7 +3275,7 @@ const isTargetOfAttack = (
               await applyRoomUpdate((cur) => cur, { sound: 'customSe1' }, true);
             }}
             title="1タップでSE1（se1.mp3）を鳴らす"
-            className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 active:scale-95 text-white rounded text-xs font-extrabold border border-amber-300/60 transition"
+            className="px-2 py-1 bg-amber-600 hover:bg-amber-500 active:scale-95 text-white rounded text-[11px] font-extrabold border border-amber-300/60 transition whitespace-nowrap shrink-0"
           >
             🔔 SE1
           </button>
@@ -3228,94 +3287,60 @@ const isTargetOfAttack = (
               await applyRoomUpdate((cur) => cur, { sound: 'customSe2' }, true);
             }}
             title="1タップでSE2（se2.mp3）を鳴らす"
-            className="px-2.5 py-1.5 bg-orange-600 hover:bg-orange-500 active:scale-95 text-white rounded text-xs font-extrabold border border-orange-300/60 transition"
+            className="px-2 py-1 bg-orange-600 hover:bg-orange-500 active:scale-95 text-white rounded text-[11px] font-extrabold border border-orange-300/60 transition whitespace-nowrap shrink-0"
           >
             📯 SE2
           </button>
 
-          <button
-            type="button"
-            onClick={async () => {
-              if (soundEnabledRef.current) playGameSound('okPikoon');
-              await applyRoomUpdate((cur) => cur, { sound: 'okPikoon' }, true);
-            }}
-            title="相手に合図音（ピコーン！）を送る"
-            className="px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 active:scale-95 text-white rounded text-xs font-extrabold border border-sky-300/60 transition"
-          >
-            💡 ピコーン
-          </button>
-
-          <div className="flex items-center gap-1 bg-slate-800 border border-slate-600 rounded px-2 py-1">
+          <div className="flex items-center gap-1 bg-slate-800 border border-slate-600 rounded px-1.5 py-0.5 shrink-0">
             <select
-              value={bgmTrackId}
-              onChange={(e) => setBgmTrackId(e.target.value)}
-              className="bg-transparent text-xs font-bold text-slate-100 focus:outline-none cursor-pointer"
-              title="BGM選択（ループ再生）"
+              value={
+                myBgmList.some((t) => t.id === room.activeBgm?.id)
+                  ? room.activeBgm?.id
+                  : room.activeBgm
+                  ? 'remote_playing'
+                  : 'off'
+              }
+              onChange={(e) => handleSelectRoomBgm(e.target.value)}
+              disabled={isSpectator}
+              className="bg-transparent text-[11px] font-bold text-slate-100 focus:outline-none cursor-pointer max-w-[130px]"
+              title="BGM選択（選ぶと相手の画面にも流れます）"
             >
-              {BGM_TRACKS.map((t) => (
-                <option key={t.id} value={t.id} className="bg-slate-900 text-white">
-                  {t.label}
+              <option value="off" className="bg-slate-900 text-slate-300">
+                🔇 BGM OFF
+              </option>
+              {room.activeBgm && !myBgmList.some((t) => t.id === room.activeBgm?.id) && (
+                <option value="remote_playing" className="bg-slate-900 text-amber-300">
+                  🎵 {room.activeBgm.name}（再生中）
+                </option>
+              )}
+              {myBgmList.map((t) => (
+                <option key={t.id} value={t.id} className="bg-slate-900 text-amber-300">
+                  🎵 {t.name}
                 </option>
               ))}
             </select>
-            {bgmTrackId !== 'off' && (
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={bgmVolume}
-                onChange={(e) => setBgmVolume(Number(e.target.value))}
-                className="w-12 accent-emerald-400 cursor-pointer"
-                title="BGM音量"
-              />
-            )}
-          </div>
-
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setSoundBoardOpen((prev) => !prev)}
-              title="押すと相手にも効果音を鳴らす"
-              className={`px-2.5 py-1.5 rounded text-xs font-extrabold border transition ${
-                soundBoardOpen
-                  ? 'bg-amber-500 text-slate-950 border-yellow-200'
-                  : 'bg-slate-800 hover:bg-slate-700 border-cyan-400/60 text-cyan-300'
-              }`}
-            >
-              🎛️ SE
-            </button>
-
-            {soundBoardOpen && (
-              <div className="absolute right-0 mt-1.5 w-64 bg-slate-900/95 border-2 border-cyan-400/80 rounded-xl p-2.5 shadow-2xl z-50 space-y-2">
-                <div className="flex items-center justify-between text-[11px] font-extrabold text-cyan-300 border-b border-slate-700 pb-1">
-                  <span>🔊 効果音サンプラー（相手にも鳴る）</span>
-                  <button
-                    type="button"
-                    onClick={() => setSoundBoardOpen(false)}
-                    className="text-slate-400 hover:text-white px-1"
-                  >
-                    ✕
-                  </button>
-                </div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {QUICK_SOUND_BUTTONS.map((btn) => (
-                    <button
-                      key={btn.label}
-                      type="button"
-                      onClick={async () => {
-                        if (soundEnabledRef.current) {
-                          playGameSound(btn.sound);
-                        }
-                        await applyRoomUpdate((cur) => cur, { sound: btn.sound }, true);
-                      }}
-                      className="py-2 px-2 bg-slate-800 hover:bg-cyan-700 active:scale-95 border border-slate-600 hover:border-cyan-300 rounded-lg text-xs font-extrabold text-white transition text-center"
-                    >
-                      {btn.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
+            {room.activeBgm && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleSelectRoomBgm('off')}
+                  title="BGMを停止（自分も相手も止まります）"
+                  className="px-1.5 py-0.5 bg-rose-700 hover:bg-rose-600 text-white rounded text-[10px] font-extrabold"
+                >
+                  ■停止
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={bgmVolume}
+                  onChange={(e) => setBgmVolume(Number(e.target.value))}
+                  className="w-10 accent-emerald-400 cursor-pointer"
+                  title="自分のBGM音量"
+                />
+              </>
             )}
           </div>
 
@@ -3324,40 +3349,41 @@ const isTargetOfAttack = (
               <button
                 type="button"
                 onClick={openHandRevealModal}
-                className="px-2.5 py-1.5 bg-fuchsia-700 hover:bg-fuchsia-600 border border-fuchsia-300/60 rounded text-xs font-extrabold"
+                className="px-2 py-1 bg-fuchsia-700 hover:bg-fuchsia-600 border border-fuchsia-300/60 rounded text-[11px] font-extrabold whitespace-nowrap shrink-0"
               >
-                🃏 手札を見せる
+                🃏 手札見せる
               </button>
               <button
                 type="button"
                 onClick={() => setDirectAttackModalOpen(true)}
-                className="px-3 py-1.5 bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white border border-yellow-300/80 rounded text-xs font-extrabold shadow-md animate-pulse"
+                title="ダイレクトアタック"
+                className="px-2 py-1 bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white border border-yellow-300/80 rounded text-[11px] font-extrabold shadow-md animate-pulse whitespace-nowrap shrink-0"
               >
-                💥 ダイレクトアタック
+                💥 DA
               </button>
               <button
                 onClick={handleUndo}
                 disabled={undoStack.length === 0}
-                className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-600 border border-slate-600 rounded text-xs font-bold transition"
+                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-600 border border-slate-600 rounded text-[11px] font-bold transition whitespace-nowrap shrink-0"
               >
-                ↩️ 1つ戻る ({undoStack.length})
+                ↩️ 戻る({undoStack.length})
               </button>
               <button
                 onClick={handleTurnStart}
-                className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-bold"
+                className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded text-[11px] font-bold whitespace-nowrap shrink-0"
               >
-                ターン開始(全起き+1ドロー)
+                ターン開始(+1)
               </button>
               <button
                 onClick={handleTurnEnd}
-                className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded text-xs font-bold"
+                className="px-2 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded text-[11px] font-extrabold whitespace-nowrap shrink-0"
               >
-                ターンエンド
+                エンド
               </button>
               <button
                 onClick={handleResetMatch}
                 disabled={resetting}
-                className="px-2.5 py-1.5 bg-rose-800 hover:bg-rose-700 border border-rose-500/60 rounded text-xs font-bold"
+                className="px-2 py-1 bg-rose-800 hover:bg-rose-700 border border-rose-500/60 rounded text-[11px] font-bold whitespace-nowrap shrink-0"
               >
                 🔄 リセット
               </button>
@@ -3394,7 +3420,7 @@ const isTargetOfAttack = (
 
               router.push('/');
             }}
-            className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-xs text-slate-300"
+            className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-[11px] text-slate-300 whitespace-nowrap shrink-0"
           >
             退出
           </button>
