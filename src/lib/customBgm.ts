@@ -8,33 +8,39 @@ export interface CustomBgmTrack {
 }
 
 const BGM_BUCKET = 'custom-bgms';
-const STORAGE_KEY = 'dm_my_custom_bgms_v1';
 
-// 自分の端末に登録したマイBGM一覧を取得
-export function getMyCustomBgms(): CustomBgmTrack[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as CustomBgmTrack[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
+// Supabaseから登録済みの共有BGM一覧をすべて取得（スマホ・PC・友達の端末すべて共通）
+export async function fetchCustomBgms(): Promise<CustomBgmTrack[]> {
+  const { data, error } = await supabase
+    .from('custom_bgms')
+    .select('id, name, url, created_at')
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('BGM一覧取得エラー:', error);
     return [];
   }
+
+  return (data || []).map((row) => ({
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    createdAt: Number(row.created_at) || 0,
+  }));
 }
 
-// 音声ファイルをSupabaseにアップロードしてマイBGMに登録（相手にも流せる共有URLを発行）
+// 音声ファイルをSupabase Storageにアップロード＆DBに登録
 export async function uploadAndSaveCustomBgm(
   name: string,
   file: File
 ): Promise<CustomBgmTrack> {
-  const ext = file.name.split('.').pop()?.toLowerCase() || 'mp3';
+  const ext = file.name.split('.').pop()?.toLowerCase() || 'm4a';
   const filePath = `bgm_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
 
   const { error: uploadError } = await supabase.storage
     .from(BGM_BUCKET)
     .upload(filePath, file, {
-      contentType: file.type || 'audio/mpeg',
+      contentType: file.type || 'audio/mp4',
       upsert: false,
     });
 
@@ -53,15 +59,22 @@ export async function uploadAndSaveCustomBgm(
     createdAt: Date.now(),
   };
 
-  const current = getMyCustomBgms();
-  const next = [...current, newTrack];
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  const { error: dbError } = await supabase.from('custom_bgms').insert({
+    id: newTrack.id,
+    name: newTrack.name,
+    url: newTrack.url,
+    created_at: newTrack.createdAt,
+  });
+
+  if (dbError) {
+    throw new Error(`BGM情報の保存に失敗しました: ${dbError.message}`);
+  }
 
   return newTrack;
 }
 
-// マイBGMを削除
-export async function deleteCustomBgm(track: CustomBgmTrack): Promise<CustomBgmTrack[]> {
+// 共有BGMを削除（DBとStorageの両方から削除）
+export async function deleteCustomBgm(track: CustomBgmTrack): Promise<void> {
   try {
     const marker = `/object/public/${BGM_BUCKET}/`;
     const idx = track.url.indexOf(marker);
@@ -73,7 +86,8 @@ export async function deleteCustomBgm(track: CustomBgmTrack): Promise<CustomBgmT
     console.warn('Storage file delete skipped:', e);
   }
 
-  const next = getMyCustomBgms().filter((t) => t.id !== track.id);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  return next;
+  const { error } = await supabase.from('custom_bgms').delete().eq('id', track.id);
+  if (error) {
+    throw new Error(`BGMの削除に失敗しました: ${error.message}`);
+  }
 }

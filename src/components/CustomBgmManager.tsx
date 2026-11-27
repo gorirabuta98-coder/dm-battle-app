@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   CustomBgmTrack,
   deleteCustomBgm,
-  getMyCustomBgms,
+  fetchCustomBgms,
   uploadAndSaveCustomBgm,
 } from '@/lib/customBgm';
 
@@ -17,8 +17,13 @@ export default function CustomBgmManager() {
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const loadTracks = async () => {
+    const list = await fetchCustomBgms();
+    setTracks(list);
+  };
+
   useEffect(() => {
-    setTracks(getMyCustomBgms());
+    loadTracks();
     return () => {
       if (previewAudioRef.current) {
         previewAudioRef.current.pause();
@@ -62,20 +67,25 @@ export default function CustomBgmManager() {
   };
 
   const handleDelete = async (track: CustomBgmTrack) => {
-    if (!confirm(`「${track.name}」を削除しますか？`)) return;
+    if (!confirm(`共有BGM「${track.name}」を削除しますか？\n（全員の一覧から消去されます）`)) return;
     if (previewingId === track.id) {
       previewAudioRef.current?.pause();
       setPreviewingId(null);
     }
-    const next = await deleteCustomBgm(track);
-    setTracks(next);
+    try {
+      await deleteCustomBgm(track);
+      setTracks((prev) => prev.filter((t) => t.id !== track.id));
+    } catch (err) {
+      console.error(err);
+      alert('削除に失敗しました');
+    }
   };
 
   return (
     <div className="bg-slate-900 border border-slate-700 rounded-2xl p-4 space-y-3 shadow-lg">
       <div className="flex items-center justify-between">
         <h2 className="font-extrabold text-sm sm:text-base text-amber-300">
-          🎵 マイBGM登録（試合中に選ぶと相手にも流れます）
+          🎵 共有BGM登録（登録すると全員の試合画面で使えます）
         </h2>
         <span className="text-xs text-slate-400">{tracks.length}曲登録済み</span>
       </div>
@@ -85,7 +95,7 @@ export default function CustomBgmManager() {
           type="text"
           value={bgmName}
           onChange={(e) => setBgmName(e.target.value)}
-          placeholder="曲名（例：通常用 / 切り札BGM / ドキンダム解放）"
+          placeholder="曲名（例：通常用 / 切り札BGM / 俺は諦めない）"
           className="sm:col-span-5 px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg text-xs sm:text-sm text-white placeholder-slate-400 focus:outline-none focus:border-amber-400"
         />
         <input

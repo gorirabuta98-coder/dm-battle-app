@@ -505,8 +505,9 @@ const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false)
 
   useEffect(() => {
     import('@/lib/customBgm')
-      .then(({ getMyCustomBgms }) => {
-        setMyBgmList(getMyCustomBgms());
+      .then(({ fetchCustomBgms }) => fetchCustomBgms())
+      .then((list) => {
+        setMyBgmList(list);
       })
       .catch(() => {});
   }, []);
