@@ -11,6 +11,7 @@ export interface CardData {
   power?: number;
   text: string;
   isShieldTrigger?: boolean;
+  isD2Field?: boolean;
   imageUrl?: string;
   aiEffects?: {
     onPlayLookDeck?: number;
@@ -28,6 +29,7 @@ export interface CardInstance extends CardData {
   kindanRole?: 'dokindam' | 'dormageddon';
   kindanAwakened?: boolean;
   kindanAwakenedImageUrl?: string;
+  d2Switched?: boolean;
 }
 
 export interface PlayerState {

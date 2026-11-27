@@ -15,16 +15,23 @@ type KindanImageKey =
   | 'dormageddonBack';
 
 function createDeckInstances(cards: CardData[]): CardInstance[] {
-  const instances: CardInstance[] = cards.map((card, index) => ({
+  let instances: CardInstance[] = cards.map((card, index) => ({
     ...card,
     instanceId: `${card.id}-${index}-${Math.random().toString(36).substring(2, 7)}`,
     tapped: false,
     faceUp: false,
     underCards: [],
   }));
-  for (let i = instances.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [instances[i], instances[j]] = [instances[j], instances[i]];
+  // 複数回のFisher-Yates＋デッキカットで初期手札・シールドの偏りを防止
+  for (let p = 0; p < 7; p++) {
+    for (let i = instances.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [instances[i], instances[j]] = [instances[j], instances[i]];
+    }
+    if (instances.length >= 4) {
+      const cut = 1 + Math.floor(Math.random() * (instances.length - 2));
+      instances = [...instances.slice(cut), ...instances.slice(0, cut)];
+    }
   }
   return instances;
 }
@@ -299,7 +306,13 @@ export default function HomePage() {
     kindanType: KindanType
   ) => {
     const allCards = createDeckInstances(deckPreset.cards);
-    const shields = allCards.slice(0, 5).map((c) => ({ ...c, faceUp: false }));
+    // S1〜S5のスロット番号を明示的に固定して、3をブレイクしても4・5が詰まらないようにする
+    const shields = allCards.slice(0, 5).map((c, idx) => ({
+      ...c,
+      faceUp: false,
+      tapped: false,
+      shieldOverlaySlot: `S${idx + 1}`,
+    }));
     const hand = allCards.slice(5, 10).map((c) => ({ ...c, faceUp: true }));
 
     const sealCount =

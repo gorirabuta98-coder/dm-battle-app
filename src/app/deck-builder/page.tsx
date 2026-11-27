@@ -12,6 +12,7 @@ interface BuilderCardItem {
   imageUrl: string;
   count: number;
   isShieldTrigger: boolean;
+  isD2Field: boolean;
 }
 
 function DeckBuilderContent() {
@@ -58,6 +59,7 @@ function DeckBuilderContent() {
               imageUrl: card.imageUrl || '',
               count: 1,
               isShieldTrigger: !!card.isShieldTrigger,
+              isD2Field: !!card.isD2Field || card.type === 'field',
             });
           }
         });
@@ -97,6 +99,7 @@ function DeckBuilderContent() {
           imageUrl: publicUrl,
           count: initialCount,
           isShieldTrigger: false,
+          isD2Field: false,
         });
       }
 
@@ -124,6 +127,7 @@ function DeckBuilderContent() {
         imageUrl: singleUrl.trim(),
         count: initialCount,
         isShieldTrigger: false,
+        isD2Field: false,
       },
     ]);
     setSingleUrl('');
@@ -141,10 +145,10 @@ function DeckBuilderContent() {
     setItems((prev) => prev.filter((item) => item.tempId !== tempId));
   };
 
-  // カード名やS・トリガー設定を個別編集
+  // カード名やS・トリガー、D2フィールド設定を個別編集
   const updateItemField = (
     tempId: string,
-    field: 'name' | 'isShieldTrigger',
+    field: 'name' | 'isShieldTrigger' | 'isD2Field',
     value: string | boolean
   ) => {
     setItems((prev) =>
@@ -167,9 +171,12 @@ function DeckBuilderContent() {
             name: item.name.trim() || `カード ${idx + 1}`,
             cost: 0,
             civilization: ['zero'],
-            type: 'creature',
-            text: '※カード画像を参照',
+            type: item.isD2Field ? 'field' : 'creature',
+            text: item.isD2Field
+              ? '【D2フィールド】場に出す時横向きで配置・D2スイッチ対応'
+              : '※カード画像を参照',
             isShieldTrigger: item.isShieldTrigger,
+            isD2Field: item.isD2Field,
             imageUrl: item.imageUrl,
           });
         }
@@ -363,18 +370,33 @@ function DeckBuilderContent() {
                   ))}
                 </div>
 
-                <label className="flex items-center gap-1.5 text-[11px] cursor-pointer text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={item.isShieldTrigger}
-                    onChange={(e) =>
-                      updateItemField(item.tempId, 'isShieldTrigger', e.target.checked)
-                    }
-                  />
-                  <span className={item.isShieldTrigger ? 'text-yellow-400 font-bold' : ''}>
-                    ⚡S・トリガー
-                  </span>
-                </label>
+                <div className="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 w-full">
+                  <label className="flex items-center gap-1 text-[11px] cursor-pointer text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={item.isShieldTrigger}
+                      onChange={(e) =>
+                        updateItemField(item.tempId, 'isShieldTrigger', e.target.checked)
+                      }
+                    />
+                    <span className={item.isShieldTrigger ? 'text-yellow-400 font-bold' : ''}>
+                      ⚡S・トリガー
+                    </span>
+                  </label>
+
+                  <label className="flex items-center gap-1 text-[11px] cursor-pointer text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={item.isD2Field}
+                      onChange={(e) =>
+                        updateItemField(item.tempId, 'isD2Field', e.target.checked)
+                      }
+                    />
+                    <span className={item.isD2Field ? 'text-cyan-400 font-bold' : ''}>
+                      🌀D2フィールド
+                    </span>
+                  </label>
+                </div>
               </div>
             ))}
           </div>

@@ -18,8 +18,13 @@ type SoundEventType =
   | 'block'
   | 'revZeroTrigger'
   | 'summon'
+  | 'evolve'
+  | 'ability'
+  | 'd2Switch'
   | 'spell'
-  | 'kindanRelease';
+  | 'kindanRelease'
+  | 'customSe1'
+  | 'customSe2';
 
 type BattleCardInstance = CardInstance & {
   ignored?: boolean;
@@ -50,10 +55,13 @@ interface ActiveAttackTarget {
   id: string;
   attackerPlayerId: string;
   attackerPlayerName: string;
+  attackerCardId?: string;
   attackerCardName: string;
   defenderPlayerId: string;
   shieldIds: string[];
+  shieldSlots?: string[];
   creatureId?: string | null;
+  isPreview?: boolean;
   timestamp: number;
 }
 
@@ -96,12 +104,29 @@ interface RoomUpdateMeta {
 const SOUND_FILE_CANDIDATES: Partial<Record<SoundEventType, string[]>> = {
   shieldBreak: ['/sounds/shield.mp3', '/sounds/ガラスが割れる1.mp3', '/sounds/ガラスが割れる1.mp3.mp3'],
   summon: ['/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
-  revZeroTrigger: ['/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
+  evolve: ['/sounds/cannon.mp3', '/sounds/summon.mp3'],
+  ability: ['/sounds/shot.mp3', '/sounds/シャキーン1.mp3'],
+  d2Switch: ['/sounds/d2_switch.mp3', '/sounds/魔法陣を展開.mp3'],
+  block: ['/sounds/block.mp3'],
+  revZeroTrigger: ['/sounds/rev0.mp3', '/sounds/summon.mp3', '/sounds/シャキーン1.mp3', '/sounds/シャキーン1.mp3.mp3'],
   directAttack: ['/sounds/direct.mp3', '/sounds/爆発2.mp3', '/sounds/爆発2.mp3.mp3'],
   spell: ['/sounds/spell.mp3', '/sounds/魔法陣を展開.mp3', '/sounds/魔法陣を展開.mp3.mp3'],
   kindanRelease: ['/sounds/kindan.mp3', '/sounds/地響き.mp3', '/sounds/地響き.mp3.mp3'],
   attack: ['/sounds/attack.mp3', '/sounds/大パンチ.mp3', '/sounds/大パンチ.mp3.mp3'],
+  // ↓ 自由に鳴らせるボタン用（public/sounds/ に se1.mp3 / se2.mp3 を置けばそのまま鳴る）
+  customSe1: ['/sounds/se1.mp3', '/sounds/shot.mp3'],
+  customSe2: ['/sounds/se2.mp3', '/sounds/cannon.mp3'],
 };
+
+const QUICK_SOUND_BUTTONS: { label: string; sound: SoundEventType }[] = [
+  { label: '💥 ビーム', sound: 'ability' },
+  { label: '💣 大砲', sound: 'evolve' },
+  { label: '🛡️ ブロック', sound: 'block' },
+  { label: '🔥 革命0', sound: 'revZeroTrigger' },
+  { label: '🌀 D2スイッチ', sound: 'd2Switch' },
+  { label: '🔔 効果音1', sound: 'customSe1' },
+  { label: '📯 効果音2', sound: 'customSe2' },
+];
 
 function playSynthFallback(type: SoundEventType) {
   try {
@@ -299,7 +324,7 @@ function createKindanCard(
   return null;
 }
 
-// シールド配列を S1, S2, S3, S4, S5... のスロット構造に変換
+// シールド配列を S1, S2, S3, S4, S5... のスロット構造に変換（3を削っても1, 2, [3空き], 4, 5の位置・番号を厳密に保持）
 function buildShieldSlots(shieldList: BattleCardInstance[]): ShieldSlotData[] {
   const slotMap = new Map<string, ShieldSlotData>();
 
@@ -339,8 +364,11 @@ function buildShieldSlots(shieldList: BattleCardInstance[]): ShieldSlotData[] {
     }
   });
 
+  // スロット番号未指定のカードがある場合のみ、空いている枠（またはS6以降）に割り当てる
   unassignedBase.forEach((c) => {
-    const emptySlot = Array.from(slotMap.values()).find((s) => !s.baseCard);
+    const emptySlot = Array.from(slotMap.values()).find(
+      (s) => !s.baseCard && s.faceUpOverlays.length === 0
+    );
     if (emptySlot) {
       emptySlot.baseCard = { ...c, shieldOverlaySlot: emptySlot.slot };
     } else {
@@ -352,7 +380,9 @@ function buildShieldSlots(shieldList: BattleCardInstance[]): ShieldSlotData[] {
 
   unassignedOverlays.forEach((c) => {
     const targetSlot =
-      Array.from(slotMap.values()).find((s) => !!s.baseCard) || ensureSlot('S1');
+      Array.from(slotMap.values()).find((s) => !!s.baseCard) ||
+      Array.from(slotMap.values()).find((s) => s.faceUpOverlays.length === 0) ||
+      ensureSlot('S1');
     targetSlot.faceUpOverlays.push({ ...c, shieldOverlaySlot: targetSlot.slot });
   });
 
@@ -370,35 +400,39 @@ function getNextEmptyOrNewSlot(shieldList: BattleCardInstance[]): string {
   return `S${slots.length + 1}`;
 }
 
-async function fetchRoomState(targetRoomId: string): Promise<ExtendedRoom | null> {
+function isD2FieldCard(card: Partial<CardInstance> | null | undefined): boolean {
+  if (!card) return false;
+  return !!card.isD2Field || card.type === 'field';
+}
+
+async function fetchRoomState(roomId: string): Promise<ExtendedRoom | null> {
   const { data, error } = await supabase
     .from('rooms')
-    .select('state')
-    .eq('room_id', targetRoomId)
+    .select('*')
+    .eq('id', roomId)
     .maybeSingle();
-
-  if (error) throw error;
-  return (data?.state as ExtendedRoom | undefined) ?? null;
+  if (error) {
+    console.error('fetchRoomState error:', error);
+    return null;
+  }
+  if (!data) return null;
+  return (data.state ?? data) as ExtendedRoom;
 }
 
-async function saveRoomState(targetRoomId: string, nextState: ExtendedRoom): Promise<void> {
+async function saveRoomState(roomId: string, state: ExtendedRoom): Promise<void> {
   const { error } = await supabase
     .from('rooms')
-    .upsert(
-      {
-        room_id: targetRoomId,
-        state: nextState,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'room_id' }
-    );
-
-  if (error) throw error;
+    .upsert({ id: roomId, state, updated_at: new Date().toISOString() });
+  if (error) {
+    console.error('saveRoomState error:', error);
+  }
 }
 
-async function deleteRoomRow(targetRoomId: string): Promise<void> {
-  const { error } = await supabase.from('rooms').delete().eq('room_id', targetRoomId);
-  if (error) throw error;
+async function deleteRoomRow(roomId: string): Promise<void> {
+  const { error } = await supabase.from('rooms').delete().eq('id', roomId);
+  if (error) {
+    console.error('deleteRoomRow error:', error);
+  }
 }
 
 function BattleRoomContent() {
@@ -412,6 +446,7 @@ function BattleRoomContent() {
   const [spectatorShowHands, setSpectatorShowHands] = useState<boolean>(true);
   const [isEvolvingBusy, setIsEvolvingBusy] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [soundBoardOpen, setSoundBoardOpen] = useState<boolean>(false);
   const [directAttackModalOpen, setDirectAttackModalOpen] = useState<boolean>(false);
   const [defenseSubMode, setDefenseSubMode] = useState<'main' | 'revZero' | 'blocker'>('main');
   const [targetBlockModalOpen, setTargetBlockModalOpen] = useState<boolean>(false);
@@ -754,12 +789,56 @@ function BattleRoomContent() {
     !!activeAttackTarget &&
     activeAttackTarget.defenderPlayerId === myPlayerId;
 
-  const isTargetOfAttack = (cardInstanceId: string, zone: 'shields' | 'battleZone'): boolean => {
+const isTargetOfAttack = (
+    cardInstanceId: string,
+    zone: 'shields' | 'battleZone',
+    slotName?: string
+  ): boolean => {
     if (!activeAttackTarget) return false;
     if (zone === 'shields') {
-      return activeAttackTarget.shieldIds?.includes(cardInstanceId) || false;
+      if (activeAttackTarget.shieldIds?.includes(cardInstanceId)) return true;
+      if (slotName && activeAttackTarget.shieldSlots?.includes(slotName)) return true;
+      return false;
     }
     return activeAttackTarget.creatureId === cardInstanceId;
+  };
+
+  // 選択中の攻撃先をリアルタイムで相手画面にも共有するヘルパー
+  const syncTargetingPreviewToRoom = async (
+    attacker: BattleCardInstance,
+    nextShieldIds: string[],
+    nextCreatureId: string | null
+  ) => {
+    if (!me || !myPlayerId || !topPlayerId || isSpectator) return;
+    const shieldSlots = nextShieldIds
+      .map((sid) => oppShields.find((s) => s.instanceId === sid)?.shieldOverlaySlot)
+      .filter((v): v is string => !!v);
+
+    const hasAny = nextShieldIds.length > 0 || !!nextCreatureId;
+    const previewTarget: ActiveAttackTarget | null = hasAny
+      ? {
+          id: `preview-${attacker.instanceId}`,
+          attackerPlayerId: myPlayerId,
+          attackerPlayerName: me.name,
+          attackerCardId: attacker.instanceId,
+          attackerCardName: attacker.name,
+          defenderPlayerId: topPlayerId,
+          shieldIds: nextShieldIds,
+          shieldSlots,
+          creatureId: nextCreatureId,
+          isPreview: true,
+          timestamp: Date.now(),
+        }
+      : null;
+
+    await applyRoomUpdate(
+      (cur) => ({
+        ...cur,
+        attackTarget: previewTarget,
+      }),
+      undefined,
+      true
+    );
   };
 
   const openAttackTargeting = (attacker: BattleCardInstance) => {
@@ -771,22 +850,41 @@ function BattleRoomContent() {
     setSelectedTargetCreatureId(null);
   };
 
-  const cancelAttackTargeting = () => {
+  const cancelAttackTargeting = async () => {
+    const hadTarget = !!targetingAttacker;
     setTargetingAttacker(null);
     setSelectedTargetShieldIds([]);
     setSelectedTargetCreatureId(null);
+    if (hadTarget && !isSpectator && activeAttackTarget?.attackerPlayerId === myPlayerId) {
+      await applyRoomUpdate(
+        (cur) => ({
+          ...cur,
+          attackTarget: null,
+        }),
+        undefined,
+        true
+      );
+    }
   };
 
-  const toggleTargetShield = (shieldId: string) => {
-    setSelectedTargetCreatureId(null);
-    setSelectedTargetShieldIds((prev) =>
-      prev.includes(shieldId) ? prev.filter((id) => id !== shieldId) : [...prev, shieldId]
-    );
+  const toggleTargetShield = async (shieldId: string) => {
+    if (!targetingAttacker) return;
+    const nextCreatureId = null;
+    const nextShieldIds = selectedTargetShieldIds.includes(shieldId)
+      ? selectedTargetShieldIds.filter((id) => id !== shieldId)
+      : [...selectedTargetShieldIds, shieldId];
+    setSelectedTargetCreatureId(nextCreatureId);
+    setSelectedTargetShieldIds(nextShieldIds);
+    await syncTargetingPreviewToRoom(targetingAttacker, nextShieldIds, nextCreatureId);
   };
 
-  const toggleTargetCreature = (creatureId: string) => {
-    setSelectedTargetShieldIds([]);
-    setSelectedTargetCreatureId((prev) => (prev === creatureId ? null : creatureId));
+  const toggleTargetCreature = async (creatureId: string) => {
+    if (!targetingAttacker) return;
+    const nextShieldIds: string[] = [];
+    const nextCreatureId = selectedTargetCreatureId === creatureId ? null : creatureId;
+    setSelectedTargetShieldIds(nextShieldIds);
+    setSelectedTargetCreatureId(nextCreatureId);
+    await syncTargetingPreviewToRoom(targetingAttacker, nextShieldIds, nextCreatureId);
   };
 
   const toggleMultiShieldId = (shieldId: string) => {
@@ -923,6 +1021,42 @@ function BattleRoomContent() {
     );
     await updateMyState({ battleZone: updatedBZ });
     setSelectedCard(null);
+  };
+  const handleActivateD2Switch = async (targetCard: BattleCardInstance) => {
+    if (!me || isSpectator) return;
+    setSelectedCard(null);
+    const nextSwitched = !targetCard.d2Switched;
+    await applyRoomUpdate(
+      (cur) => {
+        const player = cur.players[myPlayerId];
+        if (!player) return cur;
+        return {
+          ...cur,
+          players: {
+            ...cur.players,
+            [myPlayerId]: {
+              ...player,
+              battleZone: player.battleZone.map((c) =>
+                c.instanceId === targetCard.instanceId
+                  ? { ...c, d2Switched: nextSwitched, tapped: true }
+                  : c
+              ),
+            },
+          },
+        };
+      },
+      nextSwitched
+        ? {
+            sound: 'd2Switch',
+            cutIn: {
+              type: 'ability',
+              playerName: me.name,
+              card: targetCard,
+              subText: '🔄 D2スイッチ発動！！',
+            },
+          }
+        : undefined
+    );
   };
 
   const handleToggleOpponentIgnore = async (targetCard: BattleCardInstance) => {
@@ -1261,7 +1395,21 @@ function BattleRoomContent() {
           baseCards = collected;
         }
 
-        const shuffled = createDeckInstances(baseCards);
+       const rawCards = createDeckInstances(baseCards);
+        const shuffled = (() => {
+          let arr = [...rawCards];
+          for (let p = 0; p < 7; p++) {
+            for (let i = arr.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [arr[i], arr[j]] = [arr[j], arr[i]];
+            }
+            if (arr.length >= 4) {
+              const cut = 1 + Math.floor(Math.random() * (arr.length - 2));
+              arr = [...arr.slice(cut), ...arr.slice(0, cut)];
+            }
+          }
+          return arr;
+        })();
         const shields = assignInitialShieldSlots(shuffled.slice(0, 5));
         const hand = shuffled.slice(5, 10).map((c) => ({ ...c, faceUp: true }));
 
@@ -1392,10 +1540,16 @@ function BattleRoomContent() {
 
   const handleShuffle = async () => {
     if (!me || isSpectator || deck.length <= 1) return;
-    const shuffled = [...deck];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    let shuffled = [...deck];
+    for (let p = 0; p < 7; p++) {
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      if (shuffled.length >= 4) {
+        const cut = 1 + Math.floor(Math.random() * (shuffled.length - 2));
+        shuffled = [...shuffled.slice(cut), ...shuffled.slice(0, cut)];
+      }
     }
     await updateMyState({ deck: shuffled });
     alert('山札をシャッフルしました');
@@ -1469,7 +1623,7 @@ function BattleRoomContent() {
       );
     } else {
       await setInspectingStatus(
-        `${me.name} が山札の上から ${actualCount} 枚を非公開で確認中...`,
+        `${me.name} が山札の上から ${actualCount} 枚を確認中...`,
         true
       );
     }
@@ -1665,9 +1819,12 @@ function BattleRoomContent() {
         ? getNextEmptyOrNewSlot(nextShields)
         : undefined;
 
+    const isEnteringBattleZoneAsD2 =
+      toZone === 'battleZone' && fromZone !== 'battleZone' && isD2FieldCard(card);
+
     const cleanCard: BattleCardInstance = {
       ...card,
-      tapped: false,
+      tapped: isEnteringBattleZoneAsD2 ? true : false,
       faceUp: isFaceUpDest,
       underCards: isTopEvolutionToGraveyard
         ? []
@@ -1675,6 +1832,7 @@ function BattleRoomContent() {
         ? card.underCards || []
         : [],
       ignored: false,
+      d2Switched: toZone === 'battleZone' ? card.d2Switched || false : false,
       shieldOverlaySlot: resolvedSlot,
     };
 
@@ -1766,12 +1924,12 @@ function BattleRoomContent() {
       ? oppBattleZone.find((c) => c.instanceId === creatureId)
       : undefined;
 
-    const shieldLabels = shieldIds
+   const shieldLabels = shieldIds
       .map((sid) => {
         const found = oppShields.find((s) => s.instanceId === sid);
         return found?.shieldOverlaySlot || null;
       })
-      .filter(Boolean);
+      .filter((v): v is string => !!v);
 
     const targetSummary = targetCreature
       ? `相手クリーチャー「${targetCreature.name}」を攻撃！`
@@ -1785,10 +1943,13 @@ function BattleRoomContent() {
             id: `atk-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             attackerPlayerId: myPlayerId,
             attackerPlayerName: me.name,
+            attackerCardId: attacker.instanceId,
             attackerCardName: attacker.name,
             defenderPlayerId: topPlayerId,
             shieldIds,
+            shieldSlots: shieldLabels,
             creatureId,
+            isPreview: false,
             timestamp: Date.now(),
           }
         : null;
@@ -1874,7 +2035,7 @@ function BattleRoomContent() {
           type: 'ability',
           playerName: me.name,
           card: blocker,
-          subText: `🛡️ ブロッカー発動！${activeAttackTarget.attackerCardName} の攻撃をブロック！`,
+          subText: `🛡️ ブロック発動！${activeAttackTarget.attackerCardName} の攻撃をブロック！`,
         },
       }
     );
@@ -1882,7 +2043,7 @@ function BattleRoomContent() {
 
   const handleDeclareDirectAttack = async (attacker: BattleCardInstance) => {
     if (!me || isSpectator) return;
-    if (!topPlayerId) return alert('対戦相手がまだいません');
+    if (!topPlayerId) return alert('対戦相手がまだおらんでい');
 
     const updatedBZ = battleZone.map((c) =>
       c.instanceId === attacker.instanceId ? { ...c, tapped: true } : c
@@ -1932,7 +2093,7 @@ function BattleRoomContent() {
           type: 'attack',
           playerName: me.name,
           card: attacker,
-          subText: '⚠️ ダイレクトアタック宣言！！相手の対応待ち...',
+          subText: '⚠️ ダイレクトアタック宣言！！さぁどうなる',
         },
       }
     );
@@ -2121,7 +2282,7 @@ function BattleRoomContent() {
     const { evolvingCard, fromZone, selectedMaterials } = evolutionBuilder;
 
     if (selectedMaterials.length === 0) {
-      return alert('進化元（下に敷くカード）を1枚以上選んでください');
+      return alert('進化元を1枚以上選んでください');
     }
 
     setIsEvolvingBusy(true);
@@ -2252,7 +2413,7 @@ function BattleRoomContent() {
         },
         true,
         {
-          sound: 'summon',
+          sound: 'evolve',
           cutIn: {
             type: 'evolution',
             playerName: me.name,
@@ -2319,7 +2480,7 @@ function BattleRoomContent() {
       },
       true,
       {
-        sound: 'summon',
+        sound: 'evolve',
         cutIn: {
           type: 'evolution',
           playerName: me.name,
@@ -2478,9 +2639,9 @@ function BattleRoomContent() {
         }}
         title={
           !isSpectator && targetingAttacker && isOpponentZone && zone === 'battleZone'
-            ? `${card.name}（タップで攻撃対象に指定/解除）`
+            ? `${card.name}（タップで攻撃対象）`
             : showFace
-            ? `${card.name}（タップで操作・拡大）`
+            ? `${card.name}（タップで操作）`
             : '裏向きカード'
         }
         className={`relative select-none transition-all shrink-0 ${
@@ -2628,12 +2789,13 @@ function BattleRoomContent() {
         const isAnyCardSelectedForMulti =
           isMine && allCardsInSlot.some((c) => selectedShieldIds.includes(c.instanceId));
 
-        const isAnyCardTargeted =
-          !isMine &&
-          !isSpectator &&
-          ((!!targetingAttacker &&
+       const isAnyCardTargeted =
+          (!isMine &&
+            !isSpectator &&
+            !!targetingAttacker &&
             allCardsInSlot.some((c) => selectedTargetShieldIds.includes(c.instanceId))) ||
-            allCardsInSlot.some((c) => isTargetOfAttack(c.instanceId, 'shields')));
+          allCardsInSlot.some((c) => isTargetOfAttack(c.instanceId, 'shields', slot)) ||
+          (isMine && isTargetOfAttack('', 'shields', slot));
 
         const handleSlotClick = () => {
           if (isEmptySlot) return;
@@ -2931,6 +3093,53 @@ function BattleRoomContent() {
             {soundEnabled ? '🔊 音ON' : '🔇 音OFF'}
           </button>
 
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setSoundBoardOpen((prev) => !prev)}
+              title="押すと相手にも効果音を鳴らす"
+              className={`px-2.5 py-1.5 rounded text-xs font-extrabold border transition ${
+                soundBoardOpen
+                  ? 'bg-amber-500 text-slate-950 border-yellow-200'
+                  : 'bg-slate-800 hover:bg-slate-700 border-cyan-400/60 text-cyan-300'
+              }`}
+            >
+              🎛️ SE
+            </button>
+
+            {soundBoardOpen && (
+              <div className="absolute right-0 mt-1.5 w-64 bg-slate-900/95 border-2 border-cyan-400/80 rounded-xl p-2.5 shadow-2xl z-50 space-y-2">
+                <div className="flex items-center justify-between text-[11px] font-extrabold text-cyan-300 border-b border-slate-700 pb-1">
+                  <span>🔊 効果音サンプラー（相手にも鳴る）</span>
+                  <button
+                    type="button"
+                    onClick={() => setSoundBoardOpen(false)}
+                    className="text-slate-400 hover:text-white px-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {QUICK_SOUND_BUTTONS.map((btn) => (
+                    <button
+                      key={btn.label}
+                      type="button"
+                      onClick={async () => {
+                        if (soundEnabledRef.current) {
+                          playGameSound(btn.sound);
+                        }
+                        await applyRoomUpdate((cur) => cur, { sound: btn.sound }, true);
+                      }}
+                      className="py-2 px-2 bg-slate-800 hover:bg-cyan-700 active:scale-95 border border-slate-600 hover:border-cyan-300 rounded-lg text-xs font-extrabold text-white transition text-center"
+                    >
+                      {btn.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
           {!isSpectator && (
             <>
               <button
@@ -2971,7 +3180,7 @@ function BattleRoomContent() {
                 disabled={resetting}
                 className="px-2.5 py-1.5 bg-rose-800 hover:bg-rose-700 border border-rose-500/60 rounded text-xs font-bold"
               >
-                🔄 試合リセット
+                🔄 リセット
               </button>
             </>
           )}
@@ -3113,9 +3322,20 @@ function BattleRoomContent() {
 
       {/* 相手から狙われている側への通知＋ブロッカー対応バナー */}
       {amIDefendingTargetedAttack && activeAttackTarget && (
-        <div className="my-1.5 p-2.5 bg-rose-950/90 border-2 border-rose-500 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-rose-100 animate-pulse">
+        <div className="my-1.5 p-2.5 bg-rose-950/95 border-2 border-rose-400 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-rose-100 animate-pulse shadow-lg">
           <span>
-            🎯 {activeAttackTarget.attackerPlayerName} の「{activeAttackTarget.attackerCardName}」が光っている対象を狙っています！
+            🎯 {activeAttackTarget.attackerPlayerName} の「{activeAttackTarget.attackerCardName}」が
+            {activeAttackTarget.isPreview ? '攻撃先を選択中：' : '攻撃宣言！対象：'}
+            <strong className="text-yellow-300 underline ml-1">
+              {activeAttackTarget.creatureId
+                ? `クリーチャー「${
+                    battleZone.find((c) => c.instanceId === activeAttackTarget.creatureId)?.name ||
+                    '対象クリーチャー'
+                  }」`
+                : activeAttackTarget.shieldSlots && activeAttackTarget.shieldSlots.length > 0
+                ? `シールド ${activeAttackTarget.shieldSlots.join('・')}`
+                : '光っている対象'}
+            </strong>
           </span>
           <div className="flex items-center gap-1.5 shrink-0">
             <button
@@ -3259,7 +3479,7 @@ function BattleRoomContent() {
         <div className="flex items-center justify-between gap-2 min-h-[70px] bg-slate-800/40 p-2 rounded">
           <div className="flex flex-wrap gap-2 items-center flex-1">
             <span className="text-[10px] text-slate-400 mr-1">
-              バトルゾーン (タップで能力拡大・行動不能化・盾送り):
+              バトルゾーン (タップで拡大):
             </span>
             {oppNormalBattleZone.map((c) =>
               renderCard(c, 'battleZone', false, opponent?.name || '相手')
@@ -3837,7 +4057,7 @@ function BattleRoomContent() {
                   onClick={() => setDefenseSubMode('blocker')}
                   className="w-full py-3.5 px-4 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white border border-sky-300/60 rounded-xl text-sm sm:text-base font-extrabold shadow-lg transition transform active:scale-95"
                 >
-                  🛡️ ブロッカーでブロックする！（場のクリーチャー）
+                  🛡️ ブロックする！（場のクリーチャー）
                 </button>
               </div>
             )}
@@ -4640,6 +4860,7 @@ function BattleRoomContent() {
                       setSelectedCard(null);
                       if (me) {
                         await applyRoomUpdate((cur) => cur, {
+                          sound: 'ability',
                           cutIn: {
                             type: 'ability',
                             playerName: me.name,
@@ -4653,6 +4874,20 @@ function BattleRoomContent() {
                   >
                     ⚡ 能力発動でカード提示
                   </button>
+                  {isD2FieldCard(selectedCard.card) && (
+                    <button
+                      onClick={() => handleActivateD2Switch(selectedCard.card)}
+                      className={`py-2 rounded col-span-2 font-extrabold border transition shadow ${
+                        selectedCard.card.d2Switched
+                          ? 'bg-slate-700 hover:bg-slate-600 text-cyan-200 border-cyan-500/50'
+                          : 'bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white border-cyan-300'
+                      }`}
+                    >
+                      {selectedCard.card.d2Switched
+                        ? '🔄 D2スイッチを未使用状態に戻す（現在：発動済み）'
+                        : '🌀🔄 D2スイッチ発動！！（専用SE＆カットイン）'}
+                    </button>
+                  )}
                   <button
                     onClick={() => handleToggleMyIgnore(selectedCard.card)}
                     className={`py-2 rounded col-span-2 font-extrabold border transition ${
