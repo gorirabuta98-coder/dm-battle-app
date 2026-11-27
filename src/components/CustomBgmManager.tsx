@@ -91,7 +91,7 @@ export default function CustomBgmManager() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="audio/*"
+          accept="audio/*,.m4a,.mp3,.wav,.aac,.mp4,video/mp4"
           onChange={(e) => {
             const f = e.target.files?.[0] || null;
             setSelectedFile(f);
